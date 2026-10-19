@@ -147,6 +147,42 @@ export function createX402Handler(opts: X402HandlerOptions): RequestHandler {
         }
       }
 
+      // Malformed payment header response: HTTP 400 with a typed error body and
+      // fresh payment requirements so the client can retry with a valid header.
+      // Never leaks internal stack traces.
+      const respondMalformedHeader = async (): Promise<void> => {
+        const body = { error: 'malformed_payment_header' }
+        if (ozServer) {
+          const resourceInfo = {
+            url: `${req.protocol}://${req.get('host') ?? ''}${req.originalUrl}`,
+            description: opts.manifest.name,
+          }
+          const paymentRequired = await ozServer.createPaymentRequiredResponse(
+            [requirements],
+            resourceInfo,
+          )
+          res
+            .status(400)
+            .setHeader('Content-Type', 'application/json')
+            .setHeader('X-Payment-Requirements', encodePaymentRequiredHeader(paymentRequired))
+            .json(body)
+        } else {
+          const x402Response = {
+            x402Version: 2,
+            resource: {
+              url: `${req.protocol}://${req.get('host') ?? ''}${req.originalUrl}`,
+              description: opts.manifest.name,
+            },
+            accepts: [requirements],
+          }
+          res
+            .status(400)
+            .setHeader('Content-Type', 'application/json')
+            .setHeader('X-Payment-Requirements', encodePaymentRequiredHeader(x402Response))
+            .json(body)
+        }
+      }
+
       const paymentHeader = (req.headers['payment-signature'] ?? req.headers['x-payment']) as string | undefined
 
       if (!paymentHeader) {
@@ -195,109 +231,20 @@ export function createX402Handler(opts: X402HandlerOptions): RequestHandler {
         }
       }
 
-      const payload = decodePaymentSignatureHeader(paymentHeader)
+      // Decode the payment-signature header defensively. Malformed base64,
+      // truncated JSON, or unexpected types must not crash the process; they
+      // are surfaced as a clean 400 with fresh payment requirements.
+      let payload: ReturnType<typeof decodePaymentSignatureHeader>
+      try {
+        payload = decodePaymentSignatureHeader(paymentHeader)
+      } catch (err) {
+        logger.warn?.('malformed payment-signature header', err)
+        await respondMalformedHeader()
+        return
+      }
+
       let txHash: string | null = null
       // Extract payer public key defensively from the decoded x402 payload.
       // In the @x402/stellar ExactStellarScheme, the payer's G... address is at
       // payload.authorization.credentials[0].publicKey (StrKey-encoded G...).
-      // Fall back to null if the path is absent — non-fatal for settlement.
-      let payerAddress: string | null = null
-      try {
-        const creds = (
-          payload as unknown as {
-            authorization?: {
-              credentials?: Array<{ publicKey?: string }>
-            }
-          }
-        ).authorization?.credentials
-        const key = Array.isArray(creds) ? creds[0]?.publicKey : undefined
-        payerAddress = extractPayerAddress(key)
-      } catch {
-        // non-fatal
-      }
-
-      if (ozServer) {
-        const settleResult = await ozServer.settlePayment(payload, requirements)
-        const outcome = readSettleResult(settleResult)
-        if (!outcome.ok) {
-          await respondPaymentRequired('Payment settlement failed', outcome.reason)
-          return
-        }
-        txHash = outcome.txHash
-        res.setHeader(
-          'X-Payment-Response',
-          encodePaymentResponseHeader(
-            settleResult as Parameters<typeof encodePaymentResponseHeader>[0],
-          ),
-        )
-      } else {
-        const verifyResult = await localFacilitator.verify(
-          payload as Parameters<typeof localFacilitator.verify>[0],
-          requirements,
-        )
-        if (!verifyResult.isValid) {
-          res.status(401).json({
-            error: 'Payment verification failed',
-            reason: (verifyResult as { invalidReason?: string }).invalidReason,
-          })
-          return
-        }
-        const settleResult = await localFacilitator.settle(
-          payload as Parameters<typeof localFacilitator.settle>[0],
-          requirements,
-        )
-        const outcome = readSettleResult(settleResult)
-        if (!outcome.ok) {
-          await respondPaymentRequired('Payment settlement failed', outcome.reason)
-          return
-        }
-        txHash = outcome.txHash
-        res.setHeader(
-          'X-Payment-Response',
-          encodePaymentResponseHeader(
-            settleResult as Parameters<typeof encodePaymentResponseHeader>[0],
-          ),
-        )
-      }
-
-      // Record the settlement so a retry of this exact payment is deduped.
-      if (idempotencyKey) {
-        const headers: Record<string, string> = {}
-        const paymentResponse = res.getHeader('X-Payment-Response')
-        if (typeof paymentResponse === 'string') {
-          headers['X-Payment-Response'] = paymentResponse
-        }
-        try {
-          await seenTxStore.set(idempotencyKey, { txHash, headers, createdAt: Date.now() })
-        } catch (setErr) {
-          if (opts.fallbackSeenTxStore) {
-            await opts.fallbackSeenTxStore.set(idempotencyKey, { txHash, headers, createdAt: Date.now() })
-          } else {
-            throw setErr
-          }
-        }
-      }
-
-      if (txHash && opts.onSettled) {
-        Promise.resolve().then(() => opts.onSettled!(txHash!, opts.amount, 'x402', payerAddress)).catch(err => {
-          logger('error', '[x402] onSettled callback error', { error: err })
-          opts.onCallbackError?.(err, 'onSettled')
-        })
-      }
-
-      next()
-    } catch (err) {
-      if (err instanceof KikisAppManifestError) {
-        next(err)
-        return
-      }
-      if (err instanceof KikisAppNetworkError) {
-        res.setHeader('Retry-After', '5')
-        res.status(503).json({ error: 'Service Unavailable', reason: err.message })
-        return
-      }
-      logger('error', '[x402] Settlement error', { error: err })
-      res.status(500).json({ error: 'Payment settlement failed' })
-    }
-  }
-}
+      // Fall back to null if the path is absent — non-fatal 

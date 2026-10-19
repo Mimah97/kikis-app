@@ -22,6 +22,27 @@ export function base64ToUtf8(b64: string): string {
 }
 
 /**
+ * Decode a base64-encoded JSON payload from a payment header.
+ *
+ * Returns `undefined` instead of throwing when the input is not valid base64,
+ * is not valid UTF-8 JSON, or does not decode to a plain object. This lets
+ * provider middleware treat malformed `payment-signature` headers as a typed
+ * client error (HTTP 400) rather than an uncaught exception (HTTP 500).
+ */
+export function decodeBase64Json<T = unknown>(b64: string): T | undefined {
+  if (typeof b64 !== 'string' || b64.length === 0) return undefined
+  try {
+    const parsed = JSON.parse(base64ToUtf8(b64))
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return undefined
+    }
+    return parsed as T
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Decode a hex string to a `Uint8Array`. Accepts an optional `0x` prefix.
  * Mirrors `Buffer.from(hex, 'hex')` but returns a plain `Uint8Array` (which
  * `Buffer` already extends, so existing consumers are unaffected).
