@@ -43,6 +43,83 @@ export interface KikisAppFastifyOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Request body buffering
+//
+// Fastify's request.raw is a Node IncomingMessage stream. Payment verification
+// hooks may read from it (or Fastify's own body parser may have already
+// consumed it). To guarantee downstream route handlers receive the complete
+// payload, we buffer the raw stream once and replay it via a fresh Readable
+// that is swapped in for request.raw. The buffered bytes are also exposed as
+// request.body when Fastify has not already parsed a body.
+// ---------------------------------------------------------------------------
+
+/** Upper bound on buffered request body size (bytes). Guards against unbounded
+ * memory use from high-volume streaming payloads. */
+const MAX_BUFFERED_BODY_BYTES = 10 * 1024 * 1024
+
+/**
+ * Buffer the raw request stream and install a replayable replacement so that
+ * both payment verification and the downstream route handler can read the
+ * full body. Safe to call multiple times; only buffers once per request.
+ */
+async function bufferRequestBody(fastifyRequest: FastifyRequest): Promise<void> {
+  const raw = fastifyRequest.raw as IncomingMessage & { __kikisBodyBuffered?: boolean }
+  if (raw.__kikisBodyBuffered) return
+  raw.__kikisBodyBuffered = true
+
+  // If Fastify already parsed a body, the stream is drained; nothing to buffer.
+  if (fastifyRequest.body !== undefined && fastifyRequest.body !== null) return
+
+  const method = (raw.method ?? 'GET').toUpperCase()
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return
+
+  const chunks: Buffer[] = []
+  let total = 0
+  try {
+    for await (const chunk of raw) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string)
+      total += buf.length
+      if (total > MAX_BUFFERED_BODY_BYTES) {
+        // Refuse to buffer unbounded payloads; leave the stream as-is so the
+        // route handler can still consume it directly.
+        return
+      }
+      chunks.push(buf)
+    }
+  } catch {
+    // Stream already consumed or errored — leave it untouched.
+    return
+  }
+
+  const body = Buffer.concat(chunks)
+
+  // Expose parsed body when possible so Fastify route handlers see it.
+  if (body.length > 0 && fastifyRequest.body === undefined) {
+    const contentType = String(raw.headers['content-type'] ?? '')
+    if (contentType.includes('application/json')) {
+      try {
+        fastifyRequest.body = JSON.parse(body.toString('utf8'))
+      } catch {
+        // Not valid JSON — leave body undefined; raw replay still works.
+      }
+    }
+  }
+
+  // Replace the drained stream with a fresh Readable that replays the bytes.
+  const { Readable } = await import('node:stream')
+  const replay = Readable.from(body.length > 0 ? [body] : [])
+  // Preserve the original request metadata the route handler may rely on.
+  Object.assign(replay, {
+    headers: raw.headers,
+    method: raw.method,
+    url: raw.url,
+    httpVersion: raw.httpVersion,
+    socket: raw.socket,
+  })
+  fastifyRequest.raw = replay as unknown as IncomingMessage
+}
+
+// ---------------------------------------------------------------------------
 // Express-compatible shim over Node's raw http objects
 //
 // Fastify's request.raw / reply.raw are plain Node IncomingMessage /
@@ -206,161 +283,4 @@ function runExpressHandler(
 export const MPP_SESSION_WS_VERIFIED = 'kikis-app.mppSessionWs.verified'
 
 /**
- * True when the kikisAppFastify mpp-session-ws middleware verified the
- * handshake request's Payment credential (see {@link MPP_SESSION_WS_VERIFIED}).
- * WebSocket upgrade routes should refuse to upgrade when this is false:
- *
- * ```ts
- * fastify.get('/stream', { websocket: true }, (socket, request) => {
- *   if (!mppSessionWsFastifyVerified(request)) return socket.close()
- *   // ... stream to the paid client
- * })
- * ```
- */
-export function mppSessionWsFastifyVerified(request: object): boolean {
-  return (request as Record<string, unknown>)[MPP_SESSION_WS_VERIFIED] === true
-}
-
-/** True when the request is a WebSocket upgrade handshake. */
-function isWebSocketUpgradeRequest(request: FastifyRequest): boolean {
-  const upgrade = request.headers['upgrade']
-  const value = Array.isArray(upgrade) ? upgrade[0] : upgrade
-  return (value ?? '').toLowerCase() === 'websocket'
-}
-
-export function kikisAppFastify(opts: KikisAppFastifyOptions): FastifyPluginAsync {
-  const signedManifest = signManifest(opts.manifest, opts.payeeSecretKey)
-  const handlerMap = new Map<PaymentMode, RequestHandler>()
-
-  if (opts.modes.includes('x402')) {
-    const x402Price = opts.pricing.x402
-    if (x402Price) {
-      handlerMap.set(
-        'x402',
-        createX402Handler({
-          payeeSecretKey: opts.payeeSecretKey,
-          network: opts.network,
-          amount: x402Price,
-          ...(opts.assetContract ? { assetContract: opts.assetContract } : {}),
-          ...(opts.facilitatorApiKey ? { facilitatorApiKey: opts.facilitatorApiKey } : {}),
-          manifest: signedManifest,
-          ...(opts.onSettled ? { onSettled: opts.onSettled } : {}),
-          ...(opts.onCallbackError ? { onCallbackError: opts.onCallbackError } : {}),
-          ...(opts.seenTxStore ? { seenTxStore: opts.seenTxStore } : {}),
-          ...(opts.logger ? { logger: opts.logger } : {}),
-        }),
-      )
-    }
-  }
-
-  if (opts.modes.includes('mpp-charge')) {
-    const chargePrice = opts.pricing['mpp-charge']
-    if (chargePrice) {
-      handlerMap.set(
-        'mpp-charge',
-        createMppChargeHandler({
-          payeeSecretKey: opts.payeeSecretKey,
-          network: opts.network,
-          amount: chargePrice,
-          ...(opts.assetContract ? { assetContract: opts.assetContract } : {}),
-          manifest: signedManifest,
-          ...(opts.onSettled ? { onSettled: opts.onSettled } : {}),
-          ...(opts.onCallbackError ? { onCallbackError: opts.onCallbackError } : {}),
-          ...(opts.seenTxStore ? { seenTxStore: opts.seenTxStore } : {}),
-          ...(opts.logger ? { logger: opts.logger } : {}),
-        }),
-      )
-    }
-  }
-
-  // Session modes (mpp-session, mpp-session-ws) share one handler so a
-  // provider advertising both transports verifies vouchers against the same
-  // cumulative state and a DELETE close sees the combined total — mirrors
-  // kikisAppHono's shared session state. The WebSocket handshake is verified
-  // exactly like any other session request: it is an HTTP request that must
-  // carry a valid Payment credential before the app's @fastify/websocket
-  // route is allowed to upgrade it.
-  const sessionModes = (['mpp-session', 'mpp-session-ws'] as const).filter(
-    (mode) => opts.modes.includes(mode) && !!opts.pricing[mode],
-  )
-  const primarySessionMode = sessionModes[0]
-  if (primarySessionMode) {
-    if (!opts.commitmentPublicKey) {
-      throw new Error('kikisAppFastify: mpp-session/mpp-session-ws mode requires commitmentPublicKey')
-    }
-    const sessionPricing = opts.pricing[primarySessionMode]!
-    const sessionHandler = createMppSessionHandler({
-      payeeSecretKey: opts.payeeSecretKey,
-      network: opts.network,
-      channelFactory: sessionPricing.channelFactory,
-      rate: sessionPricing.rate,
-      mode: primarySessionMode,
-      ...(opts.assetContract ? { assetContract: opts.assetContract } : {}),
-      manifest: signedManifest,
-      commitmentPublicKey: opts.commitmentPublicKey,
-      ...(opts.onSettled ? { onSettled: opts.onSettled } : {}),
-      ...(opts.onSessionOpen ? { onSessionOpen: opts.onSessionOpen } : {}),
-      ...(opts.onVoucher ? { onVoucher: opts.onVoucher } : {}),
-      ...(opts.onCallbackError ? { onCallbackError: opts.onCallbackError } : {}),
-      ...(opts.onOrphaned ? { onOrphaned: opts.onOrphaned } : {}),
-      ...(opts.idleTimeoutMs != null ? { idleTimeoutMs: opts.idleTimeoutMs } : {}),
-      ...(opts.logger ? { logger: opts.logger } : {}),
-    })
-    for (const mode of sessionModes) {
-      handlerMap.set(mode, sessionHandler)
-    }
-  }
-
-  const availableModes = new Set(handlerMap.keys())
-
-  const plugin: FastifyPluginAsync = async (fastify) => {
-    // Serve the signed manifest at the well-known endpoint
-    fastify.addHook('onRequest', async (request, reply) => {
-      if (request.url === '/.well-known/kikis-app.json') {
-        reply.hijack()
-        const body = JSON.stringify(signedManifest)
-        reply.raw.setHeader('Content-Type', 'application/json')
-        reply.raw.setHeader('Content-Length', Buffer.byteLength(body))
-        reply.raw.end(body)
-        return
-      }
-
-      if (handlerMap.size === 0) return
-
-      // Route to the handler that speaks the mode the request targets — the
-      // same header-driven dispatch as the Hono and Express adapters. A
-      // WebSocket upgrade handshake is steered to the mpp-session-ws handler,
-      // so only a paid handshake can reach the app's upgrade route.
-      const isWebSocketUpgrade = isWebSocketUpgradeRequest(request)
-      const selectedMode = resolvePaymentMode(
-        (name) => {
-          const value = request.headers[name]
-          return Array.isArray(value) ? value[0] : value
-        },
-        availableModes,
-        { isWebSocketUpgrade },
-      )
-      if (!selectedMode) return
-      const handler = handlerMap.get(selectedMode)
-      if (!handler) return
-
-      await runExpressHandler(handler, request, reply)
-
-      // Payment verified and the handler passed the request through (no 402
-      // was written): flag the request so the app's @fastify/websocket route
-      // can confirm the handshake was paid via mppSessionWsFastifyVerified
-      // before performing the upgrade.
-      if (selectedMode === 'mpp-session-ws' && isWebSocketUpgrade && !reply.raw.writableEnded) {
-        Object.defineProperty(request, MPP_SESSION_WS_VERIFIED, { value: true, configurable: true })
-      }
-    })
-  }
-
-  // Fastify encapsulates plugins by default, so an onRequest hook added inside
-  // one only sees routes declared inside that same plugin. Payment middleware
-  // has to cover the routes the app declares on the parent instance, so opt out
-  // of encapsulation. This is what fastify-plugin sets, without the dependency.
-  Object.defineProperty(plugin, Symbol.for('skip-override'), { value: true })
-
-  return plugin
-}
+ * True when the kikisAppFastify mpp-session-ws mid
