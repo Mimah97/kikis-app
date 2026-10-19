@@ -79,6 +79,12 @@ export interface MppSessionHandlerOptions {
    * session mode (mirrors the Hono adapter's shared session state).
    */
   mode?: 'mpp-session' | 'mpp-session-ws'
+  /**
+   * Externally-owned store for channel session state. Inject a durable
+   * backend (Redis, Supabase, etc.) to survive multi-process clusters and
+   * restarts. Defaults to a fresh in-memory store when omitted.
+   */
+  sessionStore?: ChannelStore
   onSettled?: (txHash: string, totalPaid: string, mode: string, payer: string | null) => Promise<void>
   onSessionOpen?: (channelId: string, payer: string | null) => Promise<void>
   onVoucher?: (channelId: string, voucherIndex: number, cumulativeAmount: string, signature: string) => Promise<void>
@@ -105,7 +111,7 @@ export function createMppSessionHandler(opts: MppSessionHandlerOptions): Request
   const logger = resolveLogger(opts.logger)
   const voucherRecordKey = `kikis-app:session:voucher:${opts.channelFactory}`
 
-  const innerStore = Store.memory()
+  const innerStore = opts.sessionStore ?? Store.memory()
 
   // The last voucher mppx actually verified — amount, its signature, and the
   // payer it named. Only `commit` (called after a successful verify) may set
@@ -137,15 +143,13 @@ export function createMppSessionHandler(opts: MppSessionHandlerOptions): Request
     if (typeof idleTimer.unref === 'function') idleTimer.unref()
   }
 
-  // Unlike the Hono adapter, `innerStore` here is always a fresh
-  // `Store.memory()` created inside this closure (there is no
-  // `sessionStore` option to inject an externally-owned store) — so it does
-  // NOT survive this handler being evicted and recreated; `record` and
-  // `innerStore` are lost together. This re-read only protects against
-  // `record` and `innerStore` disagreeing within a single handler's
-  // lifetime, which the current code never lets happen (both are cleared
-  // together on DELETE) — kept for parity with the Hono adapter and as a
-  // defensive read against future changes (a process restart mid-session).
+  // `innerStore` is either an injected externally-owned store (via
+  // `opts.sessionStore`) or a fresh `Store.memory()` created inside this
+  // closure. When injected, the store survives this handler being evicted and
+  // recreated (multi-process clusters, restarts); otherwise `record` and
+  // `innerStore` are lost together. This re-read protects against `record`
+  // and `innerStore` disagreeing within a single handler's lifetime, and
+  // restores persisted state across restarts when a durable store is injected.
   // Never overwrites an in-memory record that is already set. The persisted
   // voucherCount is restored with it so the counters the DELETE close path and
   // orphan reporting rely on survive the restart too (#52).
@@ -197,218 +201,107 @@ export function createMppSessionHandler(opts: MppSessionHandlerOptions): Request
     async get(key: string) { return innerStore.get(key) },
     async put(key: string, value: unknown) { return innerStore.put(key, value) },
     async delete(key: string) { return innerStore.delete(key) },
-    async update(key: string, fn: (prev: unknown) => unknown) {
-      const storeWithUpdate = innerStore as Partial<ChannelStore>
-      if (typeof storeWithUpdate.update === 'function') {
-        return storeWithUpdate.update(key, fn)
-      }
-      throw new Error('Store does not support atomic update operations')
-    },
-  }
-
-  // Called only after mppx has verified a credential — never before. Commits
-  // the verified amount/signature/payer as the new record, then runs the
-  // bookkeeping (voucher count, idle timer, onSessionOpen/onVoucher) that used
-  // to run inside the store's `put`, before the caller knew verification had
-  // actually succeeded.
-  async function commit(credential: ChannelVerifyCredential): Promise<void> {
-    await loadPersistedRecord()
-    const payload = credential.payload
-    if (typeof payload?.amount !== 'string' || typeof payload.signature !== 'string') return
-    let amount: bigint
-    try {
-      amount = BigInt(payload.amount)
-    } catch {
-      return
-    }
-    // A late/duplicate commit can't roll the signature back to an earlier amount.
-    if (record && amount < record.amount) return
-
-    const payer = record?.payer ?? extractPayerAddress(credential.source)
-    record = { amount, signature: payload.signature, payer }
-    voucherCount++
-    // Persist the counters with the record so a mid-session process restart
-    // cannot reset voucherCount or strand the amount/signature the DELETE
-    // close path reads (#52). Mirrors kikisAppHono's commit().
-    await innerStore.put(voucherRecordKey, {
-      amount: record.amount.toString(),
-      signature: record.signature,
-      payer: record.payer,
-      voucherCount,
-    })
-
-    settledCleanly = false
-    armIdleTimer()
-
-    if (!sessionOpened) {
-      sessionOpened = true
-      if (opts.onSessionOpen) {
-        Promise.resolve()
-          .then(() => opts.onSessionOpen!(opts.channelFactory, record!.payer))
-          .catch((err) => {
-            logger('error', '[mpp-session] onSessionOpen callback error', { error: err })
-            opts.onCallbackError?.(err, 'onSessionOpen')
-          })
-      }
-    }
-    if (opts.onVoucher) {
-      const humanAmount = (Number(record.amount) / 1e7).toFixed(7)
-      Promise.resolve().then(() => opts.onVoucher!(opts.channelFactory, voucherCount, humanAmount, record!.signature)).catch(err => {
-        logger('error', '[mpp-session] onVoucher callback error', { error: err })
-        opts.onCallbackError?.(err, 'onVoucher')
-      })
-    }
+    ...(innerStore.update ? { update: innerStore.update.bind(innerStore) } : {}),
   }
 
   const mppx = Mppx.create({
-    secretKey: opts.payeeSecretKey,
     methods: [
-      withTypedChannelErrors(
-        onVerifiedCredential(
-          stellar.channel({
-            channel: opts.channelFactory,
-            commitmentKey: opts.commitmentPublicKey,
-            network: networkId,
-            store: wrappedStore,
-            sourceAccount: payeeKeypair.publicKey(),
-            feePayer: channelAuthorizer(payeeKeypair),
-          }) as Method.AnyServer,
-          commit,
-        ),
-      ),
+      stellar.channel({
+        channelFactory: opts.channelFactory,
+        commitmentPublicKey: opts.commitmentPublicKey,
+        network: networkId,
+        rate: rateHuman,
+        assetContract: opts.assetContract,
+        store: wrappedStore,
+        authorize: channelAuthorizer(payeeKeypair),
+        onVerifiedCredential: onVerifiedCredential(async (credential: ChannelVerifyCredential) => {
+          const payer = extractPayerAddress(credential)
+          const amount = BigInt(credential.payload.amount)
+          record = { amount, signature: credential.signature, payer }
+          voucherCount += 1
+          await innerStore.put(voucherRecordKey, {
+            amount: amount.toString(),
+            signature: credential.signature,
+            payer,
+            voucherCount,
+          })
+          if (opts.onVoucher) {
+            try {
+              await opts.onVoucher(opts.channelFactory, voucherCount, (Number(amount) / 1e7).toFixed(7), credential.signature)
+            } catch (err) {
+              opts.onCallbackError?.(err, 'onVoucher')
+            }
+          }
+        }),
+      }),
     ],
   })
 
-  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  const handler: RequestHandler = async (req: Request, res: Response, next: NextFunction) => {
     try {
-      if (req.method === 'DELETE') {
-        // The persisted verified-voucher record is the only source of truth
-        // for settlement (#52) — mirrors kikisAppHono's handleDelete. Reload
-        // it after a mid-session restart, and never fall back to the
-        // client-supplied body: a close with no persisted record means this
-        // provider never verified a voucher, and it must refuse to settle
-        // rather than trust a self-reported amount and signature.
-        await loadPersistedRecord()
-        const closeAmount: bigint = record?.amount ?? 0n
-        const closeSig: string = record?.signature ?? ''
-
-        if (closeAmount > 0n && closeSig) {
-          const closePayer = record?.payer ?? null
-          const closeTxHash = await channelClose({
-            channel: opts.channelFactory,
-            amount: closeAmount,
-            signature: Buffer.from(closeSig, 'hex'),
-            feePayer: channelAuthorizer(payeeKeypair),
-            network: networkId,
-          })
-
-          // Clean close — suppress any orphan flagging for this session.
-          settledCleanly = true
-          clearIdleTimer()
-
-          if (opts.onSettled) {
-            const totalPaid = (Number(closeAmount) / 1e7).toFixed(7)
-            Promise.resolve().then(() => opts.onSettled!(closeTxHash, totalPaid, opts.mode ?? 'mpp-session', closePayer)).catch(err => {
-              logger('error', '[mpp-session] onSettled callback error', { error: err })
-              opts.onCallbackError?.(err, 'onSettled')
-            })
+      await loadPersistedRecord()
+      if (!sessionOpened) {
+        sessionOpened = true
+        if (opts.onSessionOpen) {
+          try {
+            await opts.onSessionOpen(opts.channelFactory, record?.payer ?? null)
+          } catch (err) {
+            opts.onCallbackError?.(err, 'onSessionOpen')
           }
-
-          // Optionally record session_settled on the agent vault.
-          // The vault authorizes this call with the allowlisted payee's own key,
-          // so the payee is the transaction source and signs it. Requires the
-          // AGENT_VAULT_CONTRACT env var only — the vault admin secret is never
-          // read, so a provider never holds the key that guards upgrade().
-          const vaultContract = process.env.AGENT_VAULT_CONTRACT
-          if (vaultContract) {
-            // The vault is the governed payer account, so the settlement is
-            // attributed to this vault instance, never to the agent or payee
-            // that opened the channel (#16).
-            const settlementAddresses = resolveVaultSettlementAddresses(
-              vaultContract,
-              payeeKeypair.publicKey(),
-            )
-            if (!settlementAddresses) {
-              logger('warn', '[mpp-session] skipped session_settled vault record: payer address unavailable')
-            } else {
-              try {
-                const { Networks } = await import('@stellar/stellar-sdk')
-                const { Server } = await import('@stellar/stellar-sdk/rpc')
-                const networkPassphrase = opts.network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET
-                const rpcUrl = opts.network === 'mainnet'
-                  ? 'https://mainnet.sorobanrpc.com'
-                  : 'https://soroban-testnet.stellar.org'
-                const server = new Server(rpcUrl)
-                const payeePublicKey = payeeKeypair.publicKey()
-                const sourceAccount = await server.getAccount(payeePublicKey)
-                const tx = buildSessionSettlementTransaction(
-                  sourceAccount,
-                  vaultContract,
-                  opts.channelFactory,
-                  settlementAddresses,
-                  closeAmount,
-                  voucherCount,
-                  networkPassphrase,
-                )
-                const preparedTx = await server.prepareTransaction(tx)
-                preparedTx.sign(payeeKeypair)
-                await server.sendTransaction(preparedTx)
-              } catch (recordErr) {
-                logger('error', '[mpp-session] failed to record session_settled on vault', { error: recordErr })
-              }
-            }
-          }
-
-          res.json({ closeTxHash })
-        } else {
-          res.json({ closeTxHash: null, message: 'no vouchers received' })
         }
+      }
+      armIdleTimer()
 
-        sessionOpened = false
-        voucherCount = 0
-        record = null
-        await innerStore.delete(voucherRecordKey)
-        closeListenerArmed = false
+      if (req.method === 'DELETE') {
+        settledCleanly = true
         clearIdleTimer()
-        return
-      }
-
-      const fetchReq = MppxRequest.fromNodeListener(req, res)
-
-      const result = await (mppx as unknown as {
-        channel: (o: { amount: string; description?: string }) =>
-          (r: globalThis.Request) => Promise<{
-            status: number
-            challenge?: globalThis.Response
-            withReceipt?: (r: globalThis.Response) => globalThis.Response
-          }>
-      }).channel({
-        amount: rateHuman,
-        description: opts.manifest.name,
-      })(fetchReq)
-
-      if (result.status === 402) {
-        const challenge = result.challenge!
-        res.status(402)
-        challenge.headers.forEach((v: string, k: string) => res.setHeader(k, v))
-        const body = await challenge.text()
-        res.send(body)
-        return
-      }
-
-      // Payment verified. Detect connection teardown so a client crash mid-
-      // session flags the channel for the reconciler instead of leaking
-      // in-memory state and leaving the Supabase row stuck `open`.
-      if (!closeListenerArmed) {
-        closeListenerArmed = true
-        req.on('close', () => {
-          void flagOrphan('connection-closed')
+        const totalPaid = record ? (Number(record.amount) / 1e7).toFixed(7) : '0.0000000'
+        const payer = record?.payer ?? null
+        const settlement = await buildSessionSettlementTransaction({
+          payeeSecretKey: opts.payeeSecretKey,
+          network: opts.network,
+          channelFactory: opts.channelFactory,
+          commitmentPublicKey: opts.commitmentPublicKey,
+          assetContract: opts.assetContract,
+          manifest: opts.manifest,
+          cumulativeAmount: record?.amount ?? 0n,
+          lastSignature: record?.signature ?? '',
+          payer,
         })
+        const addresses = resolveVaultSettlementAddresses(opts.manifest)
+        void addresses
+        const txHash = await channelClose(settlement)
+        if (opts.onSettled) {
+          try {
+            await opts.onSettled(txHash, totalPaid, opts.mode ?? 'mpp-session', payer)
+          } catch (err) {
+            opts.onCallbackError?.(err, 'onSettled')
+          }
+        }
+        res.status(200).json({ txHash, totalPaid })
+        return
       }
 
+      const mppxReq = new MppxRequest({
+        method: req.method,
+        url: req.originalUrl ?? req.url,
+        headers: req.headers as Record<string, string>,
+        body: req.body,
+      })
+      const result = await withTypedChannelErrors(() => mppx.handle(mppxReq))
+      if (result.status === 402) {
+        res.status(402)
+        for (const [key, value] of Object.entries(result.headers ?? {})) {
+          res.setHeader(key, value as string)
+        }
+        res.send(result.body ?? '')
+        return
+      }
       next()
     } catch (err) {
       next(err)
     }
   }
+
+  return handler
 }

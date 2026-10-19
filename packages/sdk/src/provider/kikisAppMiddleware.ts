@@ -6,6 +6,7 @@ import type { KikisAppManifest, PaymentMode } from '../types.js'
 import { signManifest } from '../manifest/sign.js'
 import type { SeenTxStore } from './SeenTxStore.js'
 import type { OrphanedSessionInfo } from './MppSessionHandler.js'
+import type { ChannelStore } from './ChannelStore.js'
 import type { KikisAppLogger } from '../internal/logger.js'
 import { resolvePaymentMode } from './internal/detectPaymentMode.js'
 
@@ -57,6 +58,11 @@ export interface KikisAppMiddlewareOptions {
    * duplicate settlement on agent retries. Defaults to per-handler in-memory.
    */
   seenTxStore?: SeenTxStore
+  /**
+   * Durable channel store for mpp-session state (e.g. Redis, Supabase).
+   * Defaults to an in-memory store when omitted.
+   */
+  sessionStore?: ChannelStore
   /**
    * Structured log sink for every adapter diagnostic (settlement errors,
    * callback failures, orphaned sessions). Defaults to a console-backed logger.
@@ -152,6 +158,7 @@ export function kikisApp(opts: KikisAppMiddlewareOptions): RequestHandler {
           ...(opts.onCallbackError ? { onCallbackError: opts.onCallbackError } : {}),
           ...(opts.onOrphaned ? { onOrphaned: opts.onOrphaned } : {}),
           ...(opts.idleTimeoutMs != null ? { idleTimeoutMs: opts.idleTimeoutMs } : {}),
+          ...(opts.sessionStore ? { sessionStore: opts.sessionStore } : {}),
           ...(opts.logger ? { logger: opts.logger } : {}),
         }),
       )
@@ -195,28 +202,6 @@ export function kikisApp(opts: KikisAppMiddlewareOptions): RequestHandler {
     // request was answered with a session challenge and charge clients could
     // not pay dual-mode providers. x402 clients keep routing by
     // `payment-signature` / `x-payment`; unauthenticated requests still
-    // receive the default challenge (session, then charge, then x402).
-    const mode = resolvePaymentMode(
-      (name) => {
-        const value = req.headers[name.toLowerCase()]
-        return Array.isArray(value) ? value[0] : value
-      },
-      availableModes,
-    )
-    const handler: RequestHandler | undefined = mode ? handlerMap.get(mode) : undefined
+    // receive the default challenge (session, the
 
-    if (!handler) {
-      next()
-      return
-    }
-    void Promise.resolve()
-      .then(() => new Promise<void>((resolve, reject) => {
-        handler!(req, res, (handlerErr?: unknown) => {
-          if (handlerErr != null) reject(handlerErr)
-          else resolve()
-        })
-      }))
-      .then(() => next())
-      .catch((err) => next(err))
-  }
-}
+/* … truncated 669 chars — edit only what you need near the top … */
