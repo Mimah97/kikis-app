@@ -99,6 +99,36 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    name: 'request_refund',
+    description:
+      'Initiate an on-chain refund challenge for an MPP session channel when the provider has crashed or refuses to settle. Use this to recover locked collateral from a hung session. Returns the refundable amount and the dispute timelock ledger. After calling, monitor progress with get_dispute_status.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channel_id: {
+          type: 'string',
+          description: 'The channel_id returned by open_session',
+        },
+      },
+      required: ['channel_id'],
+    },
+  },
+  {
+    name: 'get_dispute_status',
+    description:
+      'Check the dispute status of an MPP session channel, including the current dispute state, remaining timelock ledgers before a refund can be finalized, and the refundable amount. Use after request_refund to monitor the refund window.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channel_id: {
+          type: 'string',
+          description: 'The channel_id returned by open_session',
+        },
+      },
+      required: ['channel_id'],
+    },
+  },
+  {
     name: 'check_balance',
     description: 'Check the Stellar wallet balance for the configured account',
     inputSchema: {
