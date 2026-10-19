@@ -405,3 +405,8 @@ The [**Multi-Chain Roadmap**](docs/MULTICHAIN_ROADMAP.md) sketches a `ChainAdapt
 ## License
 
 MIT
+
+## Handsoff notes
+
+<!-- handsoff-issue-71 -->
+- #71: [MCP] Enforce Sanitized URL Parsing and Block Localhost SSRF Across All MCP Tool Handlers
