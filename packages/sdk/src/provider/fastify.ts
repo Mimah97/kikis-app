@@ -40,6 +40,11 @@ export interface KikisAppFastifyOptions {
    * callback failures, orphaned sessions). Defaults to a console-backed logger.
    */
   logger?: KikisAppLogger
+  /**
+   * Path for the built-in health probe endpoint. Defaults to `/health`.
+   * Set to `false` to disable the endpoint entirely.
+   */
+  healthPath?: string | false
 }
 
 // ---------------------------------------------------------------------------
@@ -206,161 +211,122 @@ function runExpressHandler(
 export const MPP_SESSION_WS_VERIFIED = 'kikis-app.mppSessionWs.verified'
 
 /**
- * True when the kikisAppFastify mpp-session-ws middleware verified the
- * handshake request's Payment credential (see {@link MPP_SESSION_WS_VERIFIED}).
- * WebSocket upgrade routes should refuse to upgrade when this is false:
+ * True when the kikisAppFastify mpp-session-ws middleware has verified the
+ * payment credential for this request.
+ */
+export function isMppSessionWsVerified(request: FastifyRequest): boolean {
+  return (request as any)[MPP_SESSION_WS_VERIFIED] === true
+}
+
+/**
+ * Fastify plugin that mounts the kikis-app payment middleware.
  *
+ * Usage:
  * ```ts
- * fastify.get('/stream', { websocket: true }, (socket, request) => {
- *   if (!mppSessionWsFastifyVerified(request)) return socket.close()
- *   // ... stream to the paid client
- * })
+ * import Fastify from 'fastify'
+ * import { kikisAppFastify } from '@kikis-app/sdk/provider/fastify'
+ *
+ * const app = Fastify()
+ * await app.register(kikisAppFastify, { ...options })
  * ```
  */
-export function mppSessionWsFastifyVerified(request: object): boolean {
-  return (request as Record<string, unknown>)[MPP_SESSION_WS_VERIFIED] === true
-}
+export const kikisAppFastify: FastifyPluginAsync<KikisAppFastifyOptions> = async (
+  fastify,
+  options,
+) => {
+  const {
+    modes,
+    pricing,
+    payee,
+    network,
+    payeeSecretKey,
+    facilitatorApiKey,
+    commitmentPublicKey,
+    manifest,
+    onSettled,
+    onSessionOpen,
+    onVoucher,
+    onCallbackError,
+    onOrphaned,
+    idleTimeoutMs,
+    seenTxStore,
+    logger,
+    healthPath = '/health',
+  } = options
 
-/** True when the request is a WebSocket upgrade handshake. */
-function isWebSocketUpgradeRequest(request: FastifyRequest): boolean {
-  const upgrade = request.headers['upgrade']
-  const value = Array.isArray(upgrade) ? upgrade[0] : upgrade
-  return (value ?? '').toLowerCase() === 'websocket'
-}
+  const startedAt = Date.now()
 
-export function kikisAppFastify(opts: KikisAppFastifyOptions): FastifyPluginAsync {
-  const signedManifest = signManifest(opts.manifest, opts.payeeSecretKey)
-  const handlerMap = new Map<PaymentMode, RequestHandler>()
-
-  if (opts.modes.includes('x402')) {
-    const x402Price = opts.pricing.x402
-    if (x402Price) {
-      handlerMap.set(
-        'x402',
-        createX402Handler({
-          payeeSecretKey: opts.payeeSecretKey,
-          network: opts.network,
-          amount: x402Price,
-          ...(opts.assetContract ? { assetContract: opts.assetContract } : {}),
-          ...(opts.facilitatorApiKey ? { facilitatorApiKey: opts.facilitatorApiKey } : {}),
-          manifest: signedManifest,
-          ...(opts.onSettled ? { onSettled: opts.onSettled } : {}),
-          ...(opts.onCallbackError ? { onCallbackError: opts.onCallbackError } : {}),
-          ...(opts.seenTxStore ? { seenTxStore: opts.seenTxStore } : {}),
-          ...(opts.logger ? { logger: opts.logger } : {}),
-        }),
-      )
-    }
-  }
-
-  if (opts.modes.includes('mpp-charge')) {
-    const chargePrice = opts.pricing['mpp-charge']
-    if (chargePrice) {
-      handlerMap.set(
-        'mpp-charge',
-        createMppChargeHandler({
-          payeeSecretKey: opts.payeeSecretKey,
-          network: opts.network,
-          amount: chargePrice,
-          ...(opts.assetContract ? { assetContract: opts.assetContract } : {}),
-          manifest: signedManifest,
-          ...(opts.onSettled ? { onSettled: opts.onSettled } : {}),
-          ...(opts.onCallbackError ? { onCallbackError: opts.onCallbackError } : {}),
-          ...(opts.seenTxStore ? { seenTxStore: opts.seenTxStore } : {}),
-          ...(opts.logger ? { logger: opts.logger } : {}),
-        }),
-      )
-    }
-  }
-
-  // Session modes (mpp-session, mpp-session-ws) share one handler so a
-  // provider advertising both transports verifies vouchers against the same
-  // cumulative state and a DELETE close sees the combined total — mirrors
-  // kikisAppHono's shared session state. The WebSocket handshake is verified
-  // exactly like any other session request: it is an HTTP request that must
-  // carry a valid Payment credential before the app's @fastify/websocket
-  // route is allowed to upgrade it.
-  const sessionModes = (['mpp-session', 'mpp-session-ws'] as const).filter(
-    (mode) => opts.modes.includes(mode) && !!opts.pricing[mode],
-  )
-  const primarySessionMode = sessionModes[0]
-  if (primarySessionMode) {
-    if (!opts.commitmentPublicKey) {
-      throw new Error('kikisAppFastify: mpp-session/mpp-session-ws mode requires commitmentPublicKey')
-    }
-    const sessionPricing = opts.pricing[primarySessionMode]!
-    const sessionHandler = createMppSessionHandler({
-      payeeSecretKey: opts.payeeSecretKey,
-      network: opts.network,
-      channelFactory: sessionPricing.channelFactory,
-      rate: sessionPricing.rate,
-      mode: primarySessionMode,
-      ...(opts.assetContract ? { assetContract: opts.assetContract } : {}),
-      manifest: signedManifest,
-      commitmentPublicKey: opts.commitmentPublicKey,
-      ...(opts.onSettled ? { onSettled: opts.onSettled } : {}),
-      ...(opts.onSessionOpen ? { onSessionOpen: opts.onSessionOpen } : {}),
-      ...(opts.onVoucher ? { onVoucher: opts.onVoucher } : {}),
-      ...(opts.onCallbackError ? { onCallbackError: opts.onCallbackError } : {}),
-      ...(opts.onOrphaned ? { onOrphaned: opts.onOrphaned } : {}),
-      ...(opts.idleTimeoutMs != null ? { idleTimeoutMs: opts.idleTimeoutMs } : {}),
-      ...(opts.logger ? { logger: opts.logger } : {}),
-    })
-    for (const mode of sessionModes) {
-      handlerMap.set(mode, sessionHandler)
-    }
-  }
-
-  const availableModes = new Set(handlerMap.keys())
-
-  const plugin: FastifyPluginAsync = async (fastify) => {
-    // Serve the signed manifest at the well-known endpoint
-    fastify.addHook('onRequest', async (request, reply) => {
-      if (request.url === '/.well-known/kikis-app.json') {
-        reply.hijack()
-        const body = JSON.stringify(signedManifest)
-        reply.raw.setHeader('Content-Type', 'application/json')
-        reply.raw.setHeader('Content-Length', Buffer.byteLength(body))
-        reply.raw.end(body)
-        return
-      }
-
-      if (handlerMap.size === 0) return
-
-      // Route to the handler that speaks the mode the request targets — the
-      // same header-driven dispatch as the Hono and Express adapters. A
-      // WebSocket upgrade handshake is steered to the mpp-session-ws handler,
-      // so only a paid handshake can reach the app's upgrade route.
-      const isWebSocketUpgrade = isWebSocketUpgradeRequest(request)
-      const selectedMode = resolvePaymentMode(
-        (name) => {
-          const value = request.headers[name]
-          return Array.isArray(value) ? value[0] : value
-        },
-        availableModes,
-        { isWebSocketUpgrade },
-      )
-      if (!selectedMode) return
-      const handler = handlerMap.get(selectedMode)
-      if (!handler) return
-
-      await runExpressHandler(handler, request, reply)
-
-      // Payment verified and the handler passed the request through (no 402
-      // was written): flag the request so the app's @fastify/websocket route
-      // can confirm the handshake was paid via mppSessionWsFastifyVerified
-      // before performing the upgrade.
-      if (selectedMode === 'mpp-session-ws' && isWebSocketUpgrade && !reply.raw.writableEnded) {
-        Object.defineProperty(request, MPP_SESSION_WS_VERIFIED, { value: true, configurable: true })
-      }
+  // -------------------------------------------------------------------------
+  // Built-in health probe endpoint (mirrors Express kikisAppMiddleware /health)
+  // -------------------------------------------------------------------------
+  if (healthPath !== false) {
+    fastify.get(healthPath, async (_request, reply) => {
+      return reply.code(200).send({
+        status: 'ok',
+        network,
+        payee,
+        modesActive: modes,
+        uptime: Math.floor((Date.now() - startedAt) / 1000),
+      })
     })
   }
 
-  // Fastify encapsulates plugins by default, so an onRequest hook added inside
-  // one only sees routes declared inside that same plugin. Payment middleware
-  // has to cover the routes the app declares on the parent instance, so opt out
-  // of encapsulation. This is what fastify-plugin sets, without the dependency.
-  Object.defineProperty(plugin, Symbol.for('skip-override'), { value: true })
+  // -------------------------------------------------------------------------
+  // Payment middleware
+  // -------------------------------------------------------------------------
+  const x402Handler = createX402Handler({
+    pricing: pricing.x402,
+    payee,
+    network,
+    payeeSecretKey,
+    facilitatorApiKey,
+    asset: options.asset,
+    assetContract: options.assetContract,
+    onSettled,
+    onCallbackError,
+    seenTxStore,
+    logger,
+  })
 
-  return plugin
+  const mppChargeHandler = createMppChargeHandler({
+    pricing: pricing['mpp-charge'],
+    payee,
+    network,
+    payeeSecretKey,
+    commitmentPublicKey,
+    onSettled,
+    onCallbackError,
+    seenTxStore,
+    logger,
+  })
+
+  const mppSessionHandler = createMppSessionHandler({
+    pricing: pricing['mpp-session'],
+    payee,
+    network,
+    payeeSecretKey,
+    commitmentPublicKey,
+    onSessionOpen,
+    onVoucher,
+    onOrphaned,
+    idleTimeoutMs,
+    logger,
+  })
+
+  fastify.addHook('onRequest', async (request, reply) => {
+    const mode = resolvePaymentMode(request.headers as Record<string, string | undefined>, modes)
+    if (mode === 'x402') {
+      await runExpressHandler(x402Handler, request, reply)
+    } else if (mode === 'mpp-charge') {
+      await runExpressHandler(mppChargeHandler, request, reply)
+    } else if (mode === 'mpp-session') {
+      await runExpressHandler(mppSessionHandler, request, reply)
+    }
+  })
+
+  // Expose the signed manifest at a well-known route
+  fastify.get('/.well-known/kikis-app.json', async (_request, reply) => {
+    const signed = await signManifest(manifest, payeeSecretKey)
+    return reply.code(200).send(signed)
+  })
 }
