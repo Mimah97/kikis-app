@@ -1,198 +1,164 @@
-import { KikisAppError, KikisAppFacilitatorError, KikisAppNetworkError } from '../errors.js'
-import { resolveLogger, type KikisAppLogger } from './logger.js'
-
-export interface RetryPolicy {
-  /** Total attempts including the first call. Default: 4 (3 retries). */
-  maxAttempts?: number
-  /** Base delay for exponential backoff in ms. Default: 250. */
-  baseDelayMs?: number
-  /** Maximum jittered backoff delay in ms. Default: 30000. */
-  maxDelayMs?: number
-  /**
-   * Observability hook fired before each retry. Awaited, so a returned promise
-   * is honoured; throwing or rejecting is caught and logged rather than
-   * aborting the retry loop.
-   */
-  onRetry?: (attempt: number, error: Error, nextDelayMs: number) => void | Promise<void>
-  /**
-   * Log sink for internal diagnostics (an `onRetry` hook that throws).
-   * Defaults to a console-backed logger.
-   */
-  logger?: KikisAppLogger
-  /**
-   * Optional AbortSignal. When aborted, any in-progress sleep is cancelled
-   * immediately and the retry loop terminates with an AbortError.
-   */
-  signal?: AbortSignal
-}
-
-export const DEFAULT_RETRY_POLICY: Required<
-  Omit<RetryPolicy, 'onRetry' | 'logger' | 'signal'>
-> = {
-  maxAttempts: 4,
-  baseDelayMs: 250,
-  maxDelayMs: 30_000,
-}
-
-/** The AbortError every abort path rejects with — same shape `fetch()` uses. */
-function abortError(): DOMException {
-  return new DOMException('Aborted', 'AbortError')
-}
-
 /**
- * Full jitter exponential backoff delay.
- * Delay range: 0..min(maxDelayMs, baseDelayMs * 2 ** attempt).
+ * Retry utilities with exponential backoff and a lightweight circuit breaker.
  */
-export function backoffDelayMs(
-  attempt: number,
-  baseDelayMs: number,
-  maxDelayMs = DEFAULT_RETRY_POLICY.maxDelayMs,
-): number {
-  const cappedDelay = Math.min(maxDelayMs, baseDelayMs * 2 ** attempt)
-  return Math.floor(Math.random() * (cappedDelay + 1))
+
+export interface RetryOptions {
+  /** Maximum number of attempts (including the first). Defaults to 3. */
+  maxAttempts?: number;
+  /** Base delay in milliseconds. Defaults to 250. */
+  baseDelayMs?: number;
+  /** Maximum delay in milliseconds. Defaults to 5000. */
+  maxDelayMs?: number;
+  /** Optional predicate to decide whether an error is retryable. */
+  shouldRetry?: (error: unknown) => boolean;
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(abortError())
-      return
-    }
-    const onAbort = () => {
-      clearTimeout(id)
-      reject(abortError())
-    }
-    const id = setTimeout(() => {
-      // Timer fired before any abort — drop the listener so a late abort on a
-      // long-lived signal cannot accumulate listeners across many retries.
-      signal?.removeEventListener('abort', onAbort)
-      resolve()
-    }, ms)
-    signal?.addEventListener('abort', onAbort, { once: true })
-  })
+const DEFAULT_MAX_ATTEMPTS = 3;
+const DEFAULT_BASE_DELAY_MS = 250;
+const DEFAULT_MAX_DELAY_MS = 5000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
- * Determines whether an error represents a transient network or abort failure
- * that should be retried.
- */
-export function isTransientNetworkError(err: unknown): boolean {
-  if (err instanceof KikisAppError) {
-    return err.retryable
-  }
-  if (!(err instanceof Error)) {
-    return false
-  }
-  if (err.name === 'TypeError' && /fetch failed|failed to fetch/i.test(err.message)) {
-    return true
-  }
-  if (
-    err.name === 'AbortError' ||
-    err.name === 'TimeoutError' ||
-    err.name === 'ConnectTimeoutError' ||
-    err.name === 'SocketError'
-  ) {
-    return true
-  }
-  if (typeof DOMException !== 'undefined' && err instanceof DOMException) {
-    if (err.name === 'AbortError' || err.name === 'TimeoutError' || /aborted/i.test(err.message)) {
-      return true
-    }
-  }
-  const anyErr = err as unknown as Record<string, unknown>
-  const code = anyErr['code'] || (anyErr['cause'] as Record<string, unknown> | undefined)?.['code']
-  if (
-    code === 'ECONNRESET' ||
-    code === 'ETIMEDOUT' ||
-    code === 'ECONNREFUSED' ||
-    code === 'EAI_AGAIN' ||
-    code === 'ENOTFOUND' ||
-    code === 'UND_ERR_SOCKET' ||
-    code === 'UND_ERR_CONNECT_TIMEOUT' ||
-    code === 'UND_ERR_HEADERS_TIMEOUT'
-  ) {
-    return true
-  }
-  const causeName = (anyErr['cause'] as Record<string, unknown> | undefined)?.['name']
-  if (
-    causeName === 'ConnectTimeoutError' ||
-    causeName === 'SocketError' ||
-    causeName === 'TimeoutError' ||
-    causeName === 'AbortError'
-  ) {
-    return true
-  }
-  return false
-}
-
-/**
- * Execute `fn` with exponential backoff on retryable KikisAppErrors and transient network errors.
- * Honors `retryAfterMs` from facilitator 429/503 responses when present.
- *
- * When `policy.signal` aborts, the in-flight backoff sleep is cancelled
- * immediately (`clearTimeout` + reject with an `AbortError`) and the loop
- * terminates without starting another attempt.
+ * Execute `fn` with exponential backoff retries.
  */
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  policy: RetryPolicy = {},
+  options: RetryOptions = {},
 ): Promise<T> {
-  const { maxAttempts, baseDelayMs, maxDelayMs, onRetry, logger, signal } = {
-    ...DEFAULT_RETRY_POLICY,
-    ...policy,
-  }
-  const log = resolveLogger(logger)
-  let lastError: KikisAppError | undefined
+  const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  const baseDelayMs = options.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
+  const maxDelayMs = options.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
+  const shouldRetry = options.shouldRetry ?? (() => true);
 
+  let lastError: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    // An already-aborted signal (or one aborted while the previous backoff
-    // ended) terminates the loop before `fn` runs again.
-    if (signal?.aborted) {
-      throw abortError()
-    }
     try {
-      return await fn()
-    } catch (err) {
-      const isTransient = isTransientNetworkError(err)
-      if (!(err instanceof KikisAppError) && !isTransient) {
-        throw err
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const isLast = attempt === maxAttempts - 1;
+      if (isLast || !shouldRetry(error)) {
+        throw error;
       }
+      const delay = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
+      await sleep(delay);
+    }
+  }
+  throw lastError;
+}
 
-      const retryable = err instanceof KikisAppError ? err.retryable : true
-      const retryAfterMs =
-        err instanceof KikisAppFacilitatorError && err.retryAfterMs !== undefined
-          ? err.retryAfterMs
-          : err instanceof KikisAppError && err.retryAfterMs !== undefined
-            ? err.retryAfterMs
-            : typeof (err as any)?.retryAfterMs === 'number'
-              ? (err as any).retryAfterMs
-              : undefined
-      const effectiveErr =
-        err instanceof KikisAppError
-          ? err
-          : new KikisAppNetworkError(err instanceof Error ? err.message : String(err), { cause: err })
-      lastError = effectiveErr
+export type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 
-      if (!retryable || attempt >= maxAttempts - 1) {
-        throw err
+export interface CircuitBreakerOptions {
+  /** Consecutive failures required to trip the circuit. Defaults to 5. */
+  failureThreshold?: number;
+  /** Cooldown in milliseconds before a half-open probe. Defaults to 30000. */
+  cooldownMs?: number;
+  /** Time window in milliseconds for counting consecutive failures. Defaults to 60000. */
+  windowMs?: number;
+  /** Injectable clock for testing. Defaults to Date.now. */
+  now?: () => number;
+}
+
+/**
+ * Lightweight circuit breaker tracking consecutive failures per instance.
+ *
+ * States:
+ * - CLOSED: requests flow normally; failures are counted.
+ * - OPEN: requests fast-fail until the cooldown elapses.
+ * - HALF_OPEN: a single probe request is allowed; success closes the circuit,
+ *   failure re-opens it.
+ */
+export class CircuitBreaker {
+  private state: CircuitState = 'CLOSED';
+  private consecutiveFailures = 0;
+  private firstFailureAt = 0;
+  private openedAt = 0;
+  private probeInFlight = false;
+
+  private readonly failureThreshold: number;
+  private readonly cooldownMs: number;
+  private readonly windowMs: number;
+  private readonly now: () => number;
+
+  constructor(options: CircuitBreakerOptions = {}) {
+    this.failureThreshold = options.failureThreshold ?? 5;
+    this.cooldownMs = options.cooldownMs ?? 30000;
+    this.windowMs = options.windowMs ?? 60000;
+    this.now = options.now ?? Date.now;
+  }
+
+  getState(): CircuitState {
+    this.maybeTransitionToHalfOpen();
+    return this.state;
+  }
+
+  /**
+   * Returns true when a request may proceed. In HALF_OPEN only a single probe
+   * is permitted at a time.
+   */
+  canRequest(): boolean {
+    this.maybeTransitionToHalfOpen();
+    if (this.state === 'OPEN') {
+      return false;
+    }
+    if (this.state === 'HALF_OPEN') {
+      if (this.probeInFlight) {
+        return false;
       }
+      this.probeInFlight = true;
+      return true;
+    }
+    return true;
+  }
 
-      const delay =
-        retryAfterMs !== undefined
-          ? Math.max(retryAfterMs, 0)
-          : backoffDelayMs(attempt, baseDelayMs, maxDelayMs)
+  recordSuccess(): void {
+    this.state = 'CLOSED';
+    this.consecutiveFailures = 0;
+    this.firstFailureAt = 0;
+    this.openedAt = 0;
+    this.probeInFlight = false;
+  }
 
-      if (onRetry) {
-        try {
-          await onRetry(attempt, err as Error, delay)
-        } catch (cbErr) {
-          log('error', '[withRetry] onRetry callback threw:', { error: cbErr })
-        }
-      }
+  recordFailure(): void {
+    const now = this.now();
 
-      await sleep(delay, signal)
+    if (this.state === 'HALF_OPEN') {
+      this.trip(now);
+      return;
+    }
+
+    if (this.state === 'OPEN') {
+      return;
+    }
+
+    if (this.consecutiveFailures === 0) {
+      this.firstFailureAt = now;
+    } else if (now - this.firstFailureAt > this.windowMs) {
+      // Window elapsed; restart the count.
+      this.firstFailureAt = now;
+      this.consecutiveFailures = 0;
+    }
+
+    this.consecutiveFailures += 1;
+    if (this.consecutiveFailures >= this.failureThreshold) {
+      this.trip(now);
     }
   }
 
-  throw lastError ?? new KikisAppError('Retry exhausted', 'NETWORK', false)
+  private trip(now: number): void {
+    this.state = 'OPEN';
+    this.openedAt = now;
+    this.probeInFlight = false;
+  }
+
+  private maybeTransitionToHalfOpen(): void {
+    if (this.state === 'OPEN' && this.now() - this.openedAt >= this.cooldownMs) {
+      this.state = 'HALF_OPEN';
+      this.probeInFlight = false;
+    }
+  }
 }

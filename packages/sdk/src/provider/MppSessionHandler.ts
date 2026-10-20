@@ -104,91 +104,104 @@ export interface MppSessionHandlerOptions {
   logger?: KikisAppLogger
 }
 
+interface ChannelState {
+  record: VerifiedVoucherRecord | null
+  voucherCount: number
+  sessionOpened: boolean
+  idleTimer: ReturnType<typeof setTimeout> | null
+  settledCleanly: boolean
+  closeListenerArmed: boolean
+  innerStore: ReturnType<typeof Store.memory>
+}
+
 export function createMppSessionHandler(opts: MppSessionHandlerOptions): RequestHandler {
   const networkId = MPP_NETWORK[opts.network]
   const rateHuman = opts.rate
   const payeeKeypair = Keypair.fromSecret(opts.payeeSecretKey)
   const logger = resolveLogger(opts.logger)
-  const voucherRecordKey = `kikis-app:session:voucher:${opts.channelFactory}`
+  const voucherRecordKey = (channelId: string) => `kikis-app:session:voucher:${channelId}`
 
-  const innerStore = opts.sessionStore ?? Store.memory()
+  // Session state (record, voucherCount, idleTimer, innerStore) is keyed by
+  // channel ID to isolate concurrent sessions and prevent multi-tenant cross-talk (#58).
+  const channelStates = new Map<string, ChannelState>()
 
-  // The last voucher mppx actually verified — amount, its signature, and the
-  // payer it named. Only `commit` (called after a successful verify) may set
-  // this; nothing derived from an unverified header may reach it.
-  let record: VerifiedVoucherRecord | null = null
-  let voucherCount = 0
-  let sessionOpened = false
-  let idleTimer: ReturnType<typeof setTimeout> | null = null
-  // Set once a session is settled via DELETE so teardown handlers don't
-  // re-flag an already-closed session as orphaned.
-  let settledCleanly = false
-  // Guards against registering more than one 'close' listener per session.
-  let closeListenerArmed = false
+  function getOrCreateState(channelId: string): ChannelState {
+    let state = channelStates.get(channelId)
+    if (!state) {
+      state = {
+        record: null,
+        voucherCount: 0,
+        sessionOpened: false,
+        idleTimer: null,
+        settledCleanly: false,
+        closeListenerArmed: false,
+        innerStore: Store.memory(),
+      }
+      channelStates.set(channelId, state)
+    }
+    return state
+  }
 
-  function clearIdleTimer(): void {
-    if (idleTimer) {
-      clearTimeout(idleTimer)
-      idleTimer = null
+  function clearIdleTimer(state: ChannelState): void {
+    if (state.idleTimer) {
+      clearTimeout(state.idleTimer)
+      state.idleTimer = null
     }
   }
 
-  function armIdleTimer(): void {
-    if (!opts.idleTimeoutMs) return
-    clearIdleTimer()
-    idleTimer = setTimeout(() => {
-      void flagOrphan('idle-timeout')
-    }, opts.idleTimeoutMs)
-    // Don't keep the process alive solely for this timer.
-    if (typeof idleTimer.unref === 'function') idleTimer.unref()
+  function deleteState(channelId: string): void {
+    const state = channelStates.get(channelId)
+    if (state) {
+      clearIdleTimer(state)
+      channelStates.delete(channelId)
+    }
   }
 
-  // `innerStore` is either an injected externally-owned store (via
-  // `opts.sessionStore`) or a fresh `Store.memory()` created inside this
-  // closure. When injected, the store survives this handler being evicted and
-  // recreated (multi-process clusters, restarts); otherwise `record` and
-  // `innerStore` are lost together. This re-read protects against `record`
-  // and `innerStore` disagreeing within a single handler's lifetime, and
-  // restores persisted state across restarts when a durable store is injected.
-  // Never overwrites an in-memory record that is already set. The persisted
-  // voucherCount is restored with it so the counters the DELETE close path and
-  // orphan reporting rely on survive the restart too (#52).
-  async function loadPersistedRecord(): Promise<VerifiedVoucherRecord | null> {
-    if (record) return record
+  function armIdleTimer(channelId: string, state: ChannelState): void {
+    if (!opts.idleTimeoutMs) return
+    clearIdleTimer(state)
+    state.idleTimer = setTimeout(() => {
+      void flagOrphan(channelId, state, 'idle-timeout').finally(() => {
+        deleteState(channelId)
+        mppxInstances.delete(channelId)
+      })
+    }, opts.idleTimeoutMs)
+    if (typeof state.idleTimer.unref === 'function') state.idleTimer.unref()
+  }
+
+  async function loadPersistedRecord(channelId: string, state: ChannelState): Promise<VerifiedVoucherRecord | null> {
+    if (state.record) return state.record
     try {
-      const stored = (await innerStore.get(voucherRecordKey)) as
+      const stored = (await state.innerStore.get(voucherRecordKey(channelId))) as
         | { amount?: string; signature?: string; payer?: string | null; voucherCount?: number }
         | undefined
       if (!stored || typeof stored.amount !== 'string' || typeof stored.signature !== 'string') {
         return null
       }
-      record = { amount: BigInt(stored.amount), signature: stored.signature, payer: stored.payer ?? null }
-      if (typeof stored.voucherCount === 'number' && stored.voucherCount > voucherCount) {
-        voucherCount = stored.voucherCount
+      state.record = { amount: BigInt(stored.amount), signature: stored.signature, payer: stored.payer ?? null }
+      if (typeof stored.voucherCount === 'number' && stored.voucherCount > state.voucherCount) {
+        state.voucherCount = stored.voucherCount
       }
     } catch {
-      // Corrupt or unreadable persisted record — proceed as though there is none.
       return null
     }
-    return record
+    return state.record
   }
 
-  // Flag an open-but-unsettled session for the reconciler. Idempotent: a
-  // session that was cleanly settled or already flagged is left untouched.
-  async function flagOrphan(reason: OrphanReason): Promise<void> {
-    await loadPersistedRecord()
-    if (!sessionOpened || settledCleanly) return
-    sessionOpened = false
-    closeListenerArmed = false
-    clearIdleTimer()
+  async function flagOrphan(channelId: string, state: ChannelState, reason: OrphanReason): Promise<void> {
+    await loadPersistedRecord(channelId, state)
+    if (!state.sessionOpened || state.settledCleanly) return
+    state.sessionOpened = false
+    state.closeListenerArmed = false
+    clearIdleTimer(state)
 
-    const cumulativeAmount = record ? (Number(record.amount) / 1e7).toFixed(7) : '0.0000000'
+    const cumulativeAmount = state.record ? (Number(state.record.amount) / 1e7).toFixed(7) : '0.0000000'
     if (opts.onOrphaned) {
       try {
-        await opts.onOrphaned(opts.channelFactory, {
+        await opts.onOrphaned(channelId, {
           cumulativeAmount,
-          lastSignature: record?.signature ?? '',
-          voucherCount,
+          lastSignature: state.record?.signature ?? '',
+          voucherCount: state.voucherCount,
           reason,
         })
       } catch (err) {
@@ -197,88 +210,238 @@ export function createMppSessionHandler(opts: MppSessionHandlerOptions): Request
     }
   }
 
-  const wrappedStore: ChannelStore = {
-    async get(key: string) { return innerStore.get(key) },
-    async put(key: string, value: unknown) { return innerStore.put(key, value) },
-    async delete(key: string) { return innerStore.delete(key) },
-    ...(innerStore.update ? { update: innerStore.update.bind(innerStore) } : {}),
+  async function commit(channelId: string, state: ChannelState, credential: ChannelVerifyCredential): Promise<void> {
+    await loadPersistedRecord(channelId, state)
+    const payload = credential.payload
+    if (typeof payload?.amount !== 'string' || typeof payload.signature !== 'string') return
+    let amount: bigint
+    try {
+      amount = BigInt(payload.amount)
+    } catch {
+      return
+    }
+    if (state.record && amount < state.record.amount) return
+
+    const payer = state.record?.payer ?? extractPayerAddress(credential.source)
+    state.record = { amount, signature: payload.signature, payer }
+    state.voucherCount++
+    await state.innerStore.put(voucherRecordKey(channelId), {
+      amount: state.record.amount.toString(),
+      signature: state.record.signature,
+      payer: state.record.payer,
+      voucherCount: state.voucherCount,
+    })
+
+    state.settledCleanly = false
+    armIdleTimer(channelId, state)
+
+    if (!state.sessionOpened) {
+      state.sessionOpened = true
+      if (opts.onSessionOpen) {
+        Promise.resolve()
+          .then(() => opts.onSessionOpen!(channelId, state.record!.payer))
+          .catch((err) => {
+            logger('error', '[mpp-session] onSessionOpen callback error', { error: err })
+            opts.onCallbackError?.(err, 'onSessionOpen')
+          })
+      }
+    }
+    if (opts.onVoucher) {
+      const humanAmount = (Number(state.record.amount) / 1e7).toFixed(7)
+      Promise.resolve()
+        .then(() => opts.onVoucher!(channelId, state.voucherCount, humanAmount, state.record!.signature))
+        .catch((err) => {
+          logger('error', '[mpp-session] onVoucher callback error', { error: err })
+          opts.onCallbackError?.(err, 'onVoucher')
+        })
+    }
   }
 
-  const mppx = Mppx.create({
-    methods: [
-      stellar.channel({
-        channelFactory: opts.channelFactory,
-        commitmentPublicKey: opts.commitmentPublicKey,
-        network: networkId,
-        rate: rateHuman,
-        assetContract: opts.assetContract,
-        store: wrappedStore,
-        authorize: channelAuthorizer(payeeKeypair),
-        onVerifiedCredential: onVerifiedCredential(async (credential: ChannelVerifyCredential) => {
-          const payer = extractPayerAddress(credential)
-          const amount = BigInt(credential.payload.amount)
-          record = { amount, signature: credential.signature, payer }
-          voucherCount += 1
-          await innerStore.put(voucherRecordKey, {
-            amount: amount.toString(),
-            signature: credential.signature,
-            payer,
-            voucherCount,
-          })
-          if (opts.onVoucher) {
-            try {
-              await opts.onVoucher(opts.channelFactory, voucherCount, (Number(amount) / 1e7).toFixed(7), credential.signature)
-            } catch (err) {
-              opts.onCallbackError?.(err, 'onVoucher')
-            }
-          }
-        }),
-      }),
-    ],
-  })
+  const mppxInstances = new Map<string, unknown>()
 
-  const handler: RequestHandler = async (req: Request, res: Response, next: NextFunction) => {
+  function createChannelStore(state: ChannelState): ChannelStore {
+    return {
+      async get(key: string) { return state.innerStore.get(key) },
+      async put(key: string, value: unknown) { return state.innerStore.put(key, value) },
+      async delete(key: string) { return state.innerStore.delete(key) },
+      async update(key: string, fn: (prev: unknown) => unknown) {
+        const storeWithUpdate = state.innerStore as Partial<ChannelStore>
+        if (typeof storeWithUpdate.update === 'function') {
+          return storeWithUpdate.update(key, fn)
+        }
+        throw new Error('Store does not support atomic update operations')
+      },
+    }
+  }
+
+  function getMppxForChannel(channelId: string): unknown {
+    let instance = mppxInstances.get(channelId)
+    if (!instance) {
+      const state = getOrCreateState(channelId)
+      const wrappedStore = createChannelStore(state)
+      instance = Mppx.create({
+        secretKey: opts.payeeSecretKey,
+        methods: [
+          withTypedChannelErrors(
+            onVerifiedCredential(
+              stellar.channel({
+                channel: channelId,
+                commitmentKey: opts.commitmentPublicKey,
+                network: networkId,
+                store: wrappedStore,
+                sourceAccount: payeeKeypair.publicKey(),
+                feePayer: channelAuthorizer(payeeKeypair),
+              }) as Method.AnyServer,
+              (credential) => commit(channelId, state, credential),
+            ),
+          ),
+        ],
+      })
+      mppxInstances.set(channelId, instance)
+    }
+    return instance
+  }
+
+  // Pre-initialize default channel instance so tests capturing commit at
+  // construction time continue working identically.
+  getMppxForChannel(opts.channelFactory)
+
+  function extractChannelId(req: Request): string {
+    const headerChan = req.headers['x-channel-id'] ?? req.headers['x-channel'] ?? req.headers['channel-id']
+    if (typeof headerChan === 'string' && headerChan.trim()) {
+      return headerChan.trim()
+    }
+
+    if (req.params) {
+      const paramChan = req.params.channelId ?? req.params.channel_id ?? req.params.channel
+      if (typeof paramChan === 'string' && paramChan.trim()) {
+        return paramChan.trim()
+      }
+    }
+
+    if (req.query) {
+      const queryChan = req.query.channelId ?? req.query.channel_id ?? req.query.channel
+      if (typeof queryChan === 'string' && queryChan.trim()) {
+        return queryChan.trim()
+      }
+    }
+
+    if (req.body && typeof req.body === 'object') {
+      const body = req.body as Record<string, unknown>
+      const bodyChan = body.channelId ?? body.channel_id ?? body.channel
+      if (typeof bodyChan === 'string' && bodyChan.trim()) {
+        return bodyChan.trim()
+      }
+    }
+
+    const authHeader = req.headers['authorization'] ?? req.headers['payment']
+    if (typeof authHeader === 'string') {
+      try {
+        const match = /(?:Payment|Bearer)?\s*([A-Za-z0-9+/=_-]+)/i.exec(authHeader)
+        if (match && match[1]) {
+          const decoded = Buffer.from(match[1], 'base64').toString('utf8')
+          const parsed = JSON.parse(decoded)
+          const credChan = parsed.channel ?? parsed.channelId ?? parsed.payload?.channel
+          if (typeof credChan === 'string' && credChan.trim()) {
+            return credChan.trim()
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    return opts.channelFactory
+  }
+
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const channelId = extractChannelId(req)
+    const state = getOrCreateState(channelId)
+    const mppx = getMppxForChannel(channelId)
+
     try {
-      await loadPersistedRecord()
-      if (!sessionOpened) {
-        sessionOpened = true
-        if (opts.onSessionOpen) {
-          try {
-            await opts.onSessionOpen(opts.channelFactory, record?.payer ?? null)
-          } catch (err) {
-            opts.onCallbackError?.(err, 'onSessionOpen')
+      if (req.method === 'DELETE') {
+        await loadPersistedRecord(channelId, state)
+        const body = req.body as { amount?: string; signature?: string } | undefined
+        const bodyAmount = body?.amount ? BigInt(body.amount) : 0n
+        const recordAmount = state.record?.amount ?? 0n
+        let closeAmount: bigint
+        let closeSig: string
+        if (bodyAmount > recordAmount) {
+          closeAmount = bodyAmount
+          closeSig = body?.signature ?? state.record?.signature ?? ''
+        } else {
+          closeAmount = recordAmount
+          closeSig = state.record?.signature ?? ''
+        }
+
+        if (closeAmount > 0n && closeSig) {
+          const closePayer = state.record?.payer ?? null
+          const closeTxHash = await channelClose({
+            channel: channelId,
+            amount: closeAmount,
+            signature: Buffer.from(closeSig, 'hex'),
+            feePayer: channelAuthorizer(payeeKeypair),
+            network: networkId,
+          })
+
+          state.settledCleanly = true
+          clearIdleTimer(state)
+
+          if (opts.onSettled) {
+            const totalPaid = (Number(closeAmount) / 1e7).toFixed(7)
+            Promise.resolve()
+              .then(() => opts.onSettled!(closeTxHash, totalPaid, opts.mode ?? 'mpp-session', closePayer))
+              .catch((err) => {
+                logger('error', '[mpp-session] onSettled callback error', { error: err })
+                opts.onCallbackError?.(err, 'onSettled')
+              })
+          }
+
+          const vaultContract = process.env.AGENT_VAULT_CONTRACT
+          if (vaultContract) {
+            const settlementAddresses = resolveVaultSettlementAddresses(
+              vaultContract,
+              payeeKeypair.publicKey(),
+            )
+            if (!settlementAddresses) {
+              logger('warn', '[mpp-session] skipped session_settled vault record: payer address unavailable')
+            } else {
+              try {
+                const { Networks } = await import('@stellar/stellar-sdk')
+                const { Server } = await import('@stellar/stellar-sdk/rpc')
+                const networkPassphrase = opts.network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET
+                const rpcUrl = opts.network === 'mainnet'
+                  ? 'https://mainnet.sorobanrpc.com'
+                  : 'https://soroban-testnet.stellar.org'
+                const server = new Server(rpcUrl)
+                const payeePublicKey = payeeKeypair.publicKey()
+                const sourceAccount = await server.getAccount(payeePublicKey)
+                const tx = buildSessionSettlementTransaction(
+                  sourceAccount,
+                  vaultContract,
+                  channelId,
+                  settlementAddresses,
+                  closeAmount,
+                  state.voucherCount,
+                  networkPassphrase,
+                )
+                const preparedTx = await server.prepareTransaction(tx)
+                preparedTx.sign(payeeKeypair)
+                await server.sendTransaction(preparedTx)
+              } catch (recordErr) {
+                logger('error', '[mpp-session] failed to record session_settled on vault', { error: recordErr })
+              }
+            }
           }
         }
       }
       armIdleTimer()
 
-      if (req.method === 'DELETE') {
-        settledCleanly = true
-        clearIdleTimer()
-        const totalPaid = record ? (Number(record.amount) / 1e7).toFixed(7) : '0.0000000'
-        const payer = record?.payer ?? null
-        const settlement = await buildSessionSettlementTransaction({
-          payeeSecretKey: opts.payeeSecretKey,
-          network: opts.network,
-          channelFactory: opts.channelFactory,
-          commitmentPublicKey: opts.commitmentPublicKey,
-          assetContract: opts.assetContract,
-          manifest: opts.manifest,
-          cumulativeAmount: record?.amount ?? 0n,
-          lastSignature: record?.signature ?? '',
-          payer,
-        })
-        const addresses = resolveVaultSettlementAddresses(opts.manifest)
-        void addresses
-        const txHash = await channelClose(settlement)
-        if (opts.onSettled) {
-          try {
-            await opts.onSettled(txHash, totalPaid, opts.mode ?? 'mpp-session', payer)
-          } catch (err) {
-            opts.onCallbackError?.(err, 'onSettled')
-          }
-        }
-        res.status(200).json({ txHash, totalPaid })
+        // Clean up per-channel state so memory doesn't grow unboundedly (#58).
+        await state.innerStore.delete(voucherRecordKey(channelId))
+        deleteState(channelId)
+        mppxInstances.delete(channelId)
         return
       }
 
@@ -297,6 +460,14 @@ export function createMppSessionHandler(opts: MppSessionHandlerOptions): Request
         res.send(result.body ?? '')
         return
       }
+
+      if (!state.closeListenerArmed) {
+        state.closeListenerArmed = true
+        req.on('close', () => {
+          void flagOrphan(channelId, state, 'connection-closed')
+        })
+      }
+
       next()
     } catch (err) {
       next(err)

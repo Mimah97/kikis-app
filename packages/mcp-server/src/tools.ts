@@ -15,6 +15,14 @@ import type { Tool } from '@modelcontextprotocol/sdk/types.js'
  */
 export const MAX_STREAM_MESSAGES = 50
 
+/**
+ * Pagination bounds for list_providers. The registry can scale to hundreds of
+ * providers, so results are paged to keep tool responses within LLM context
+ * limits and to bound tool call latency.
+ */
+export const DEFAULT_LIST_PROVIDERS_LIMIT = 20
+export const MAX_LIST_PROVIDERS_LIMIT = 100
+
 export const TOOLS: Tool[] = [
   {
     name: 'pay_for_data',
@@ -40,6 +48,34 @@ export const TOOLS: Tool[] = [
         },
       },
       required: ['url', 'max_amount'],
+    },
+  },
+  {
+    name: 'estimate_cost',
+    description:
+      'Estimate the financial cost of a provider data feed or API endpoint before paying, so an agent can plan budgets and request human approval if costs exceed thresholds. Returns the asset, amount, network fees, required trustlines, and payment mode. Supports both discrete per-request estimation and streaming session estimation (pass mode "mpp-session" or "mpp-session-ws" with an optional session_duration_seconds).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description:
+            'The full URL of the provider endpoint to estimate (e.g., https://api-a.kikis-app.xyz/price)',
+        },
+        mode: {
+          type: 'string',
+          enum: ['x402', 'mpp-charge', 'mpp-session', 'mpp-session-ws'],
+          description:
+            'Optional payment mode to estimate. Discrete modes ("x402", "mpp-charge") estimate a single request; streaming modes ("mpp-session", "mpp-session-ws") estimate a session. If not specified, the best mode is selected automatically.',
+        },
+        session_duration_seconds: {
+          type: 'integer',
+          minimum: 1,
+          description:
+            'Optional session duration in seconds for streaming session estimation (mpp-session or mpp-session-ws). Ignored for discrete modes.',
+        },
+      },
+      required: ['url'],
     },
   },
   {
@@ -99,6 +135,36 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    name: 'request_refund',
+    description:
+      'Initiate an on-chain refund challenge for an MPP session channel when the provider has crashed or refuses to settle. Use this to recover locked collateral from a hung session. Returns the refundable amount and the dispute timelock ledger. After calling, monitor progress with get_dispute_status.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channel_id: {
+          type: 'string',
+          description: 'The channel_id returned by open_session',
+        },
+      },
+      required: ['channel_id'],
+    },
+  },
+  {
+    name: 'get_dispute_status',
+    description:
+      'Check the dispute status of an MPP session channel, including the current dispute state, remaining timelock ledgers before a refund can be finalized, and the refundable amount. Use after request_refund to monitor the refund window.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channel_id: {
+          type: 'string',
+          description: 'The channel_id returned by open_session',
+        },
+      },
+      required: ['channel_id'],
+    },
+  },
+  {
     name: 'check_balance',
     description: 'Check the Stellar wallet balance for the configured account',
     inputSchema: {
@@ -120,7 +186,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'list_providers',
     description:
-      'List available KikisApp providers from the registry. Can filter by capability tags (returns providers matching any of the given tags) and by network.',
+      'List available KikisApp providers from the registry. Can filter by capability tags (returns providers matching any of the given tags) and by network. Results are paginated: use limit (default 20, max 100) and offset to page through large registries.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -132,6 +198,17 @@ export const TOOLS: Tool[] = [
           type: 'string',
           enum: ['testnet', 'mainnet'],
           description: 'Filter by Stellar network',
+        },
+        limit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: MAX_LIST_PROVIDERS_LIMIT,
+          description: `Maximum number of providers to return (1 to ${MAX_LIST_PROVIDERS_LIMIT}, default ${DEFAULT_LIST_PROVIDERS_LIMIT})`,
+        },
+        offset: {
+          type: 'integer',
+          minimum: 0,
+          description: 'Number of providers to skip before returning results (default 0)',
         },
       },
       required: [],

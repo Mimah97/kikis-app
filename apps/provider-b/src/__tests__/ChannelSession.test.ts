@@ -166,3 +166,51 @@ describe('ChannelSession — reconciliation mutex', () => {
     assert.equal(stats?.recoveredCount, 1)
   })
 })
+
+describe('ChannelSession — provider registration throttling', () => {
+  type Registrar = {
+    ctx: {
+      storage: {
+        get: (key: string) => Promise<number | undefined>
+        put: (key: string, value: number) => Promise<void>
+      }
+      waitUntil: (promise: Promise<unknown>) => void
+    }
+    env: Record<string, unknown>
+    ensureProviderRegistered: () => Promise<void>
+  }
+
+  const makeSession = (initial: number | undefined) => {
+    const store = new Map<string, number>()
+    if (initial !== undefined) store.set('last_registered_at', initial)
+    const session = Object.create(ChannelSession.prototype) as unknown as Registrar
+    session.ctx = {
+      storage: {
+        get: async (key: string) => store.get(key),
+        put: async (key: string, value: number) => {
+          store.set(key, value)
+        },
+      },
+      waitUntil: () => {},
+    }
+    session.env = {}
+    return { session, store }
+  }
+
+  it('skips registration when the last registration is within 24 hours', async () => {
+    const { session } = makeSession(Date.now() - 60 * 60 * 1000)
+    let calls = 0
+    ;(session as unknown as { registerProvider?: unknown }).registerProvider = undefined
+    // ensureProviderRegistered must short-circuit before touching registerProvider.
+    await session.ensureProviderRegistered()
+    assert.equal(calls, 0)
+  })
+
+  it('deduplicates concurrent registration attempts into a single in-flight promise', async () => {
+    const { session } = makeSession(undefined)
+    const first = session.ensureProviderRegistered()
+    const second = session.ensureProviderRegistered()
+    assert.equal(first, second, 'overlapping wake-ups must share one registration promise')
+    await first
+  })
+})

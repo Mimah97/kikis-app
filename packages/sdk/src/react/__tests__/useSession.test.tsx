@@ -179,4 +179,73 @@ describe('useSession', () => {
       mock.emit('session:voucher', { vouchersIssued: 99, currentCumulative: '0.0099' })
     })
   })
+
+  it('transitions status to closed when the session times out', async () => {
+    const client = newClient()
+    const mock = mockSession()
+    client.openSession = async () => mock.handle
+
+    const { result } = renderHook(() => useSession('https://x.test/stream'), {
+      wrapper: wrapper(client),
+    })
+    await act(async () => {
+      await result.current.open()
+    })
+    await waitFor(() => assert.equal(result.current.status, 'open'))
+
+    // The SDK handle fires 'session:timeout' when maxDurationMs elapses and
+    // auto-closes the session in the background.
+    act(() => {
+      mock.emit('session:timeout', { channelId: 'C123' })
+    })
+
+    await waitFor(() => assert.equal(result.current.status, 'closed'))
+    assert.equal(result.current.error, null)
+  })
+
+  it('transitions status to error when auto-close fails after timeout', async () => {
+    const client = newClient()
+    const mock = mockSession()
+    client.openSession = async () => mock.handle
+
+    const { result } = renderHook(() => useSession('https://x.test/stream'), {
+      wrapper: wrapper(client),
+    })
+    await act(async () => {
+      await result.current.open()
+    })
+    await waitFor(() => assert.equal(result.current.status, 'open'))
+
+    // The SDK handle fires 'session:close-failed' when the on-chain
+    // auto-close rejects.
+    act(() => {
+      mock.emit('session:close-failed', {
+        channelId: 'C123',
+        error: new Error('auto-close rejected'),
+      })
+    })
+
+    await waitFor(() => assert.equal(result.current.status, 'error'))
+    assert.ok(result.current.error)
+    assert.match(result.current.error?.message ?? '', /auto-close rejected/)
+  })
+
+  it('detaches timeout and close-failed listeners on unmount', async () => {
+    const client = newClient()
+    const mock = mockSession()
+    client.openSession = async () => mock.handle
+
+    const { result, unmount } = renderHook(() => useSession('https://x.test/stream'), {
+      wrapper: wrapper(client),
+    })
+    await act(async () => {
+      await result.current.open()
+    })
+    assert.equal(mock.listenerCount('session:timeout'), 1)
+    assert.equal(mock.listenerCount('session:close-failed'), 1)
+
+    unmount()
+    assert.equal(mock.listenerCount('session:timeout'), 0)
+    assert.equal(mock.listenerCount('session:close-failed'), 0)
+  })
 })

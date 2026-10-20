@@ -40,6 +40,11 @@ export interface KikisAppFastifyOptions {
    * callback failures, orphaned sessions). Defaults to a console-backed logger.
    */
   logger?: KikisAppLogger
+  /**
+   * Path for the built-in health probe endpoint. Defaults to `/health`.
+   * Set to `false` to disable the endpoint entirely.
+   */
+  healthPath?: string | false
 }
 
 // ---------------------------------------------------------------------------
@@ -283,4 +288,122 @@ function runExpressHandler(
 export const MPP_SESSION_WS_VERIFIED = 'kikis-app.mppSessionWs.verified'
 
 /**
- * True when the kikisAppFastify mpp-session-ws mid
+ * True when the kikisAppFastify mpp-session-ws middleware has verified the
+ * payment credential for this request.
+ */
+export function isMppSessionWsVerified(request: FastifyRequest): boolean {
+  return (request as any)[MPP_SESSION_WS_VERIFIED] === true
+}
+
+/**
+ * Fastify plugin that mounts the kikis-app payment middleware.
+ *
+ * Usage:
+ * ```ts
+ * import Fastify from 'fastify'
+ * import { kikisAppFastify } from '@kikis-app/sdk/provider/fastify'
+ *
+ * const app = Fastify()
+ * await app.register(kikisAppFastify, { ...options })
+ * ```
+ */
+export const kikisAppFastify: FastifyPluginAsync<KikisAppFastifyOptions> = async (
+  fastify,
+  options,
+) => {
+  const {
+    modes,
+    pricing,
+    payee,
+    network,
+    payeeSecretKey,
+    facilitatorApiKey,
+    commitmentPublicKey,
+    manifest,
+    onSettled,
+    onSessionOpen,
+    onVoucher,
+    onCallbackError,
+    onOrphaned,
+    idleTimeoutMs,
+    seenTxStore,
+    logger,
+    healthPath = '/health',
+  } = options
+
+  const startedAt = Date.now()
+
+  // -------------------------------------------------------------------------
+  // Built-in health probe endpoint (mirrors Express kikisAppMiddleware /health)
+  // -------------------------------------------------------------------------
+  if (healthPath !== false) {
+    fastify.get(healthPath, async (_request, reply) => {
+      return reply.code(200).send({
+        status: 'ok',
+        network,
+        payee,
+        modesActive: modes,
+        uptime: Math.floor((Date.now() - startedAt) / 1000),
+      })
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // Payment middleware
+  // -------------------------------------------------------------------------
+  const x402Handler = createX402Handler({
+    pricing: pricing.x402,
+    payee,
+    network,
+    payeeSecretKey,
+    facilitatorApiKey,
+    asset: options.asset,
+    assetContract: options.assetContract,
+    onSettled,
+    onCallbackError,
+    seenTxStore,
+    logger,
+  })
+
+  const mppChargeHandler = createMppChargeHandler({
+    pricing: pricing['mpp-charge'],
+    payee,
+    network,
+    payeeSecretKey,
+    commitmentPublicKey,
+    onSettled,
+    onCallbackError,
+    seenTxStore,
+    logger,
+  })
+
+  const mppSessionHandler = createMppSessionHandler({
+    pricing: pricing['mpp-session'],
+    payee,
+    network,
+    payeeSecretKey,
+    commitmentPublicKey,
+    onSessionOpen,
+    onVoucher,
+    onOrphaned,
+    idleTimeoutMs,
+    logger,
+  })
+
+  fastify.addHook('onRequest', async (request, reply) => {
+    const mode = resolvePaymentMode(request.headers as Record<string, string | undefined>, modes)
+    if (mode === 'x402') {
+      await runExpressHandler(x402Handler, request, reply)
+    } else if (mode === 'mpp-charge') {
+      await runExpressHandler(mppChargeHandler, request, reply)
+    } else if (mode === 'mpp-session') {
+      await runExpressHandler(mppSessionHandler, request, reply)
+    }
+  })
+
+  // Expose the signed manifest at a well-known route
+  fastify.get('/.well-known/kikis-app.json', async (_request, reply) => {
+    const signed = await signManifest(manifest, payeeSecretKey)
+    return reply.code(200).send(signed)
+  })
+}

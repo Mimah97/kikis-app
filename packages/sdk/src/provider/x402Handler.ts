@@ -34,6 +34,68 @@ const CAIP2: Record<Network, X402Network> = {
 
 const OZ_FACILITATOR_URL = 'https://channels.openzeppelin.com/x402'
 
+/**
+ * Tolerance applied when comparing an authorization's expiration deadline
+ * against the local clock. Absorbs small clock drift between the agent and
+ * this provider so a freshly signed authorization is never rejected.
+ */
+const CLOCK_SKEW_MS = 5_000
+
+/**
+ * Extract the authorization expiration deadline (ms since epoch) from a
+ * decoded x402 payment payload. Supports an explicit `expiresAt` (seconds or
+ * milliseconds) and falls back to deriving it from `maxTimeoutSeconds`
+ * relative to the payload's `validAfter`/`issuedAt` timestamp when present.
+ * Returns `null` when the payload carries no expiration information.
+ */
+function extractAuthorizationExpiry(payload: unknown): number | null {
+  if (!payload || typeof payload !== 'object') return null
+  const p = payload as Record<string, unknown>
+
+  const toMs = (value: unknown): number | null => {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      // Values below ~1e12 are treated as seconds since epoch.
+      return value < 1e12 ? value * 1000 : value
+    }
+    if (typeof value === 'string' && value.trim() !== '') {
+      const asNumber = Number(value)
+      if (Number.isFinite(asNumber)) {
+        return asNumber < 1e12 ? asNumber * 1000 : asNumber
+      }
+      const parsed = Date.parse(value)
+      if (!Number.isNaN(parsed)) return parsed
+    }
+    return null
+  }
+
+  const candidates: unknown[] = [p.expiresAt, p.expiration, p.deadline]
+  const authorization = p.authorization
+  if (authorization && typeof authorization === 'object') {
+    const a = authorization as Record<string, unknown>
+    candidates.push(a.expiresAt, a.expiration, a.deadline)
+  }
+  for (const candidate of candidates) {
+    const ms = toMs(candidate)
+    if (ms !== null) return ms
+  }
+
+  // Derive from maxTimeoutSeconds relative to a start timestamp when present.
+  const maxTimeoutSeconds = toMs(p.maxTimeoutSeconds)
+  if (maxTimeoutSeconds !== null) {
+    const startCandidates: unknown[] = [p.validAfter, p.issuedAt, p.createdAt]
+    if (authorization && typeof authorization === 'object') {
+      const a = authorization as Record<string, unknown>
+      startCandidates.push(a.validAfter, a.issuedAt, a.createdAt)
+    }
+    for (const start of startCandidates) {
+      const startMs = toMs(start)
+      if (startMs !== null) return startMs + maxTimeoutSeconds
+    }
+  }
+
+  return null
+}
+
 export interface X402HandlerOptions {
   payeeSecretKey: string
   network: Network
@@ -231,15 +293,15 @@ export function createX402Handler(opts: X402HandlerOptions): RequestHandler {
         }
       }
 
-      // Decode the payment-signature header defensively. Malformed base64,
-      // truncated JSON, or unexpected types must not crash the process; they
-      // are surfaced as a clean 400 with fresh payment requirements.
-      let payload: ReturnType<typeof decodePaymentSignatureHeader>
-      try {
-        payload = decodePaymentSignatureHeader(paymentHeader)
-      } catch (err) {
-        logger.warn?.('malformed payment-signature header', err)
-        await respondMalformedHeader()
+      const payload = decodePaymentSignatureHeader(paymentHeader)
+
+      // Replay protection: reject stale authorizations whose validity window
+      // has lapsed before initiating any on-chain settlement. A payload with no
+      // expiration information is allowed through (the idempotency store still
+      // guards against duplicate settlement).
+      const expiresAt = extractAuthorizationExpiry(payload)
+      if (expiresAt !== null && Date.now() > expiresAt + CLOCK_SKEW_MS) {
+        res.status(400).json({ error: 'authorization_expired' })
         return
       }
 

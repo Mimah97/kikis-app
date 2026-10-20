@@ -1,37 +1,26 @@
-// Full SDK — types, client, provider, store, registry
+// Public API surface for @kikis-app/kikis-app.
+//
+// Everything a downstream consumer needs — types, errors, client, provider,
+// and testing helpers — is re-exported here so custom stores, handlers, and
+// middleware never have to reach into undocumented internal paths.
+
 export * from './types.js'
 export * from './errors.js'
-export type { RetryPolicy } from './internal/retry.js'
-export { withRetry, backoffDelayMs, DEFAULT_RETRY_POLICY } from './internal/retry.js'
+
+// Provider internals that are part of the public integration surface.
 export {
-  createConsoleLogger,
-  consoleLogger,
-  noopLogger,
-  resolveLogger,
-} from './internal/logger.js'
+  InMemorySeenTxStore,
+  SETTLEMENT_REPLAY_WINDOW_MS,
+  MAX_SETTLEMENT_REPLAYS,
+  checkSettlementReplay,
+} from './provider/SeenTxStore.js'
 export type {
-  KikisAppLogger,
-  KikisAppLogLevel,
-  KikisAppLogFields,
-} from './internal/logger.js'
-export { usdcToStroops, usdcToUnits, USDC_DECIMALS, amountToStroops, stroopsToAmount } from './internal/usdc.js'
-export {
-  normalizeManifestAssets,
-  getEligibleAssets,
-  selectAsset,
-  isAssetEligible,
-  resolveAssetContract,
-} from './internal/assetUtils.js'
-export * from './client/KikisAppClient.js'
-export * from './client/ModeRouter.js'
-export * from './client/x402Client.js'
-export * from './client/MppChargeClient.js'
-export * from './client/NulthVault.js'
-export * from './store/SessionStore.js'
-export * from './store/SpendStore.js'
-export * from './store/SupabaseSeenTxStore.js'
-export * from './provider/kikisAppMiddleware.js'
-export * from './provider/registerProvider.js'
-export * from './provider/SessionReconciler.js'
-export * from './registry/index.js'
-export { signManifest, verifyManifestSignature, manifestDigest } from './manifest/sign.js'
+  SettlementScope,
+  SettlementRecord,
+  SeenTxStore,
+  SeenTxStoreOptions,
+  InMemorySeenTxStoreOptions,
+  SettlementReplayCheck,
+} from './provider/SeenTxStore.js'
+
+export type { OrphanedSessionInfo } from './provider/MppSessionHandler.js'

@@ -408,5 +408,8 @@ MIT
 
 ## Handsoff notes
 
-<!-- handsoff-issue-71 -->
-- #71: [MCP] Enforce Sanitized URL Parsing and Block Localhost SSRF Across All MCP Tool Handlers
+<!-- handsoff-issue-63 -->
+- #63: [Contracts] Add Expiration Grace Window to Pending Wasm Upgrades in Agent Vault Contract
+
+<!-- handsoff-issue-64 -->
+- #64: [Contracts] Implement Contract View Function for Current Daily Spend and Remaining Allowance

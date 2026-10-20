@@ -9,13 +9,17 @@ function mockSupabase(opts: {
   queryError?: string
   upsertError?: string
   updateError?: string
+  insertError?: { message: string; code?: string } | string
   data?: Record<string, unknown> | null
   onUpsert?: (payload: Record<string, unknown>, options?: unknown) => void
+  onInsert?: (payload: Record<string, unknown>) => void
   onUpdate?: (payload: Record<string, unknown>, eqField?: string, eqVal?: string) => void
 }): SupabaseClient {
   return {
     from(_table: string) {
       let updatePayload: Record<string, unknown> | null = null
+      let eqField: string | undefined
+      let eqVal: string | undefined
       return {
         select(_cols: string) {
           return {
@@ -31,6 +35,18 @@ function mockSupabase(opts: {
             },
           }
         },
+        insert(payload: Record<string, unknown>) {
+          opts.onInsert?.(payload)
+          opts.onUpsert?.(payload)
+          const err =
+            typeof opts.insertError === 'string'
+              ? { message: opts.insertError }
+              : opts.insertError ?? null
+          return Promise.resolve({
+            data: null,
+            error: err,
+          })
+        },
         upsert(payload: Record<string, unknown>, options?: unknown) {
           opts.onUpsert?.(payload, options)
           return Promise.resolve({
@@ -40,15 +56,45 @@ function mockSupabase(opts: {
         },
         update(payload: Record<string, unknown>) {
           updatePayload = payload
-          return {
+          const query = {
             eq(field: string, val: string) {
+              eqField = field
+              eqVal = val
               opts.onUpdate?.(updatePayload!, field, val)
+              return query
+            },
+            lt(_field: string, _val: string) {
+              return query
+            },
+            select(_cols?: string) {
+              let matched = false
+              if (opts.data && opts.data[eqField ?? 'channel_id'] === eqVal) {
+                if (updatePayload && 'cumulative_amount' in updatePayload) {
+                  const existingAmt = Number(opts.data['cumulative_amount'])
+                  const newAmt = Number(updatePayload['cumulative_amount'])
+                  if (newAmt > existingAmt) {
+                    matched = true
+                  }
+                } else {
+                  matched = true
+                }
+              }
               return Promise.resolve({
-                data: null,
+                data: matched ? [{ [eqField ?? 'channel_id']: eqVal }] : [],
                 error: opts.updateError ? { message: opts.updateError } : null,
               })
             },
+            then(
+              onFulfilled: (res: { data: unknown; error: unknown }) => unknown,
+              onRejected?: (err: unknown) => unknown,
+            ) {
+              return Promise.resolve({
+                data: null,
+                error: opts.updateError ? { message: opts.updateError } : null,
+              }).then(onFulfilled, onRejected)
+            },
           }
+          return query
         },
       }
     },
@@ -248,4 +294,173 @@ describe('SupabaseSessionStore', () => {
     )
     assert.equal(upsertCalled, false)
   })
+
+  // Issue #55 — Replace IEEE 754 parseFloat with Stroop BigInt Arithmetic
+  it('enforces exact BigInt stroop monotonicity on sub-micro fractional amounts (0.0000001 USDC)', async () => {
+    // 0.0000001 USDC = 1 stroop
+    const store = new SupabaseSessionStore(
+      mockSupabase({
+        data: {
+          ...sampleRow,
+          cumulative_amount: '0.0000002', // 2 stroops stored
+        },
+      }),
+    )
+
+    // Rejection on lower sub-micro amount (1 stroop <= 2 stroops)
+    await assert.rejects(
+      () =>
+        store.upsert('channel_123', {
+          ...sampleState,
+          cumulative_amount: '0.0000001', // 1 stroop
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof KikisAppVoucherMonotonicityError)
+        assert.match(err.message, /1 <= 2/)
+        return true
+      },
+    )
+
+    // Rejection on equal sub-micro amount (2 stroops <= 2 stroops)
+    await assert.rejects(
+      () =>
+        store.upsert('channel_123', {
+          ...sampleState,
+          cumulative_amount: '0.0000002', // 2 stroops
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof KikisAppVoucherMonotonicityError)
+        assert.match(err.message, /2 <= 2/)
+        return true
+      },
+    )
+  })
+
+  it('avoids IEEE 754 floating point rounding drift on 7-decimal boundary comparisons', async () => {
+    // In IEEE 754 64-bit float: 0.0000001 + 0.0000002 = 0.00000030000000000004
+    // With BigInt stroops: exactly 3 stroops.
+    const store = new SupabaseSessionStore(
+      mockSupabase({
+        data: {
+          ...sampleRow,
+          cumulative_amount: '0.0000003', // 3 stroops
+        },
+      }),
+    )
+
+    await assert.rejects(
+      () =>
+        store.upsert('channel_123', {
+          ...sampleState,
+          cumulative_amount: '0.0000003',
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof KikisAppVoucherMonotonicityError)
+        assert.match(err.message, /3 <= 3/)
+        return true
+      },
+    )
+  })
+
+  // Issue #56 — Eliminate TOCTOU race condition with atomic SQL updates
+  it('preserves strict monotonicity under 10 parallel voucher upserts on the same channel ID', async () => {
+    // In-memory mock simulating a single row in Supabase with atomic conditional UPDATE:
+    // UPDATE sessions SET ... WHERE channel_id = $id AND cumulative_amount < $new
+    let currentRow: Record<string, unknown> = {
+      ...sampleRow,
+      channel_id: 'concurrent_chan',
+      cumulative_amount: '0.0000000',
+    }
+
+    const concurrentSupabase = {
+      from(_table: string) {
+        let updatePayload: Record<string, unknown> | null = null
+        let eqChan: string | undefined
+        let ltAmount: string | undefined
+        return {
+          select(_cols: string) {
+            return {
+              eq(_f: string, _v: string) {
+                return {
+                  maybeSingle() {
+                    return Promise.resolve({ data: { ...currentRow }, error: null })
+                  },
+                }
+              },
+            }
+          },
+          update(payload: Record<string, unknown>) {
+            updatePayload = payload
+            const q = {
+              eq(_field: string, val: string) {
+                eqChan = val
+                return q
+              },
+              lt(_field: string, val: string) {
+                ltAmount = val
+                return q
+              },
+              select(_cols?: string) {
+                // Atomic compare-and-swap:
+                // only update if currentRow.channel_id === eqChan AND BigInt(current) < BigInt(new)
+                const currentStroops = BigInt(Math.round(Number(currentRow.cumulative_amount) * 1e7))
+                const nextStroops = BigInt(Math.round(Number(updatePayload?.cumulative_amount ?? 0) * 1e7))
+                if (currentRow.channel_id === eqChan && currentStroops < nextStroops) {
+                  currentRow = { ...currentRow, ...updatePayload }
+                  return Promise.resolve({ data: [{ channel_id: eqChan }], error: null })
+                }
+                return Promise.resolve({ data: [], error: null })
+              },
+            }
+            return q
+          },
+        }
+      },
+    } as unknown as SupabaseClient
+
+    const store = new SupabaseSessionStore(concurrentSupabase)
+
+    // Launch 10 parallel upserts with amounts 0.0000001 through 0.0000010 (1 to 10 stroops)
+    // in randomized / parallel order
+    const amounts = [
+      '0.0000005',
+      '0.0000002',
+      '0.0000010',
+      '0.0000001',
+      '0.0000007',
+      '0.0000003',
+      '0.0000009',
+      '0.0000004',
+      '0.0000008',
+      '0.0000006',
+    ]
+
+    const results = await Promise.allSettled(
+      amounts.map((amount) =>
+        store.upsert('concurrent_chan', {
+          ...sampleState,
+          channel_id: 'concurrent_chan',
+          cumulative_amount: amount,
+        }),
+      ),
+    )
+
+    // The final stored amount must be strictly the highest amount: '0.0000010'
+    assert.equal(currentRow.cumulative_amount, '0.0000010')
+
+    // At least one succeeded, and any failed promises failed with KikisAppVoucherMonotonicityError
+    let successes = 0
+    for (const res of results) {
+      if (res.status === 'fulfilled') {
+        successes++
+      } else {
+        assert.ok(
+          res.reason instanceof KikisAppVoucherMonotonicityError,
+          `Expected KikisAppVoucherMonotonicityError but got: ${res.reason}`,
+        )
+      }
+    }
+    assert.ok(successes >= 1, 'At least one upsert should succeed')
+  })
 })
+

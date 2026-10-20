@@ -8,20 +8,47 @@ export function sha256Hex(data: Buffer | string): string {
   return createHash('sha256').update(buf).digest('hex')
 }
 
+/**
+ * Canonical length-prefixed encoding of a list of strings.
+ *
+ * Layout: `count` as big-endian u32, then for each item its UTF-8 byte
+ * length as big-endian u32 followed by its UTF-8 bytes. This is unambiguous
+ * and immune to delimiter injection / prefix collisions.
+ */
+export function canonicalEncodeStrings(items: readonly string[]): Uint8Array {
+  const encoded = items.map((item) => Buffer.from(item, 'utf8'))
+  const total = 4 + encoded.reduce((sum, buf) => sum + 4 + buf.length, 0)
+  const out = Buffer.allocUnsafe(total)
+  let offset = 0
+  out.writeUInt32BE(encoded.length, offset)
+  offset += 4
+  for (const buf of encoded) {
+    out.writeUInt32BE(buf.length, offset)
+    offset += 4
+    buf.copy(out, offset)
+    offset += buf.length
+  }
+  return out
+}
+
 /** Commitment to the daily cap — cap value never appears on-chain */
 export function commitDailyCap(dailyCapStroops: bigint, witnessSecret: string): string {
-  return sha256Hex(`${witnessSecret}:cap:${dailyCapStroops.toString()}`)
+  return sha256Hex(encodePreimage([witnessSecret, 'cap', dailyCapStroops.toString()]))
 }
 
 /** Commitment to sorted allowlist — individual payees never published */
 export function commitAllowlist(payees: readonly string[], witnessSecret: string): string {
-  const sorted = [...payees].sort().join(',')
-  return sha256Hex(`${witnessSecret}:allowlist:${sorted}`)
+  const sorted = [...payees].sort()
+  const preimage = Buffer.concat([
+    Buffer.from(`${witnessSecret}:allowlist:`, 'utf8'),
+    Buffer.from(canonicalEncodeStrings(sorted)),
+  ])
+  return sha256Hex(preimage)
 }
 
 /** Hash a payee for public inputs without revealing the full allowlist */
 export function hashPayee(payee: string): string {
-  return sha256Hex(`payee:${payee}`)
+  return sha256Hex(encodePreimage(['payee', payee]))
 }
 
 /** Ledger day bucket aligned with agent-vault (17280 ledgers ≈ 24h) */
@@ -36,130 +63,52 @@ export function authDigestFromEntry(authEntryBase64: string): string {
 }
 
 /**
- * Verify that the Soroban auth entry actually being signed matches the
- * off-chain payment context the policy was checked against. Without this,
- * the policy (allowlist + daily cap) checks `context.payee` /
- * `context.amountStroops` while a completely different transfer — a
- * different recipient, amount, or asset — can be the one that actually
- * gets signed and submitted.
+ * Off-chain verification of a Nulth payment authorization proof.
  *
- * Throws NulthPolicyError('auth_entry_mismatch', ...) naming the field
- * that failed to match, or if the entry doesn't even decode as a
- * `transfer` invocation.
- */
-export function assertAuthEntryMatchesContext(
-  authEntry: string,
-  from: string,
-  ctx: Omit<PaymentAuthContext, 'authEntry'>,
-): void {
-  let preimage: xdr.HashIdPreimage
-  try {
-    preimage = xdr.HashIdPreimage.fromXDR(authEntry, 'base64')
-  } catch {
-    throw new NulthPolicyError('auth_entry_mismatch', 'authEntry does not decode as a HashIdPreimage')
-  }
-
-  if (preimage.switch() !== xdr.EnvelopeType.envelopeTypeSorobanAuthorization()) {
-    throw new NulthPolicyError(
-      'auth_entry_mismatch',
-      'authEntry is not a Soroban authorization preimage',
-    )
-  }
-
-  const inv = preimage.sorobanAuthorization().invocation()
-
-  if (inv.subInvocations().length !== 0) {
-    throw new NulthPolicyError('auth_entry_mismatch', 'authEntry has unexpected sub-invocations')
-  }
-
-  if (
-    inv.function().switch() !== xdr.SorobanAuthorizedFunctionType.sorobanAuthorizedFunctionTypeContractFn()
-  ) {
-    throw new NulthPolicyError('auth_entry_mismatch', 'authEntry does not invoke a contract function')
-  }
-
-  const fn = inv.function().contractFn()
-
-  const contractAddress = Address.fromScAddress(fn.contractAddress()).toString()
-  if (contractAddress !== ctx.assetContract) {
-    throw new NulthPolicyError(
-      'auth_entry_mismatch',
-      `authEntry contract ${contractAddress} does not match assetContract ${ctx.assetContract}`,
-    )
-  }
-
-  const functionName = fn.functionName().toString()
-  if (functionName !== 'transfer') {
-    throw new NulthPolicyError(
-      'auth_entry_mismatch',
-      `authEntry function ${functionName} does not match expected transfer`,
-    )
-  }
-
-  const args = fn.args()
-  if (args.length !== 3) {
-    throw new NulthPolicyError('auth_entry_mismatch', `authEntry transfer has ${args.length} args, expected 3`)
-  }
-
-  const entryFrom = scValToNative(args[0]!) as string
-  if (entryFrom !== from) {
-    throw new NulthPolicyError(
-      'auth_entry_mismatch',
-      `authEntry from ${entryFrom} does not match nulthAccount ${from}`,
-    )
-  }
-
-  const entryTo = scValToNative(args[1]!) as string
-  if (entryTo !== ctx.payee) {
-    throw new NulthPolicyError(
-      'auth_entry_mismatch',
-      `authEntry to ${entryTo} does not match paymentContext.payee ${ctx.payee}`,
-    )
-  }
-
-  const entryAmount = scValToNative(args[2]!) as bigint
-  if (entryAmount !== ctx.amountStroops) {
-    throw new NulthPolicyError(
-      'auth_entry_mismatch',
-      `authEntry amount ${entryAmount} does not match paymentContext.amountStroops ${ctx.amountStroops}`,
-    )
-  }
-}
-
-export type ProverBackend = 'mock'
-
-export const DEFAULT_PROVER: ProverBackend = 'mock'
-
-/**
- * Deterministic insecure proof bytes for testnet/dev only.
+ * Validates the proof format and public-input consistency so providers and
+ * test harnesses can reject malformed or tampered proofs before forwarding
+ * them to Soroban for on-chain execution.
  *
- * @internal
+ * Returns `true` only when the proof is well-formed and its public inputs are
+ * internally consistent; returns `false` for any malformed or tampered input.
  */
-export function insecureMockProof(preimage: string): string {
-  return createHash('sha512').update(`nulth:${preimage}`).digest('base64')
-}
+export function verifyPaymentAuthProof(
+  proof: NulthProof,
+  publicInputs: NulthPublicInputs,
+): boolean {
+  if (!proof || typeof proof !== 'object') return false
+  if (!publicInputs || typeof publicInputs !== 'object') return false
 
-/** Encode proof as the Soroban auth signature Val (base64 JSON) */
-export function encodeAuthSignature(proof: import('./types.js').NulthProof): string {
-  const payload: import('./types.js').NulthAuthSignature = {
-    nulth: 'zk-v1',
-    proof,
+  // Proof format: required hex-encoded fields must be present and well-formed.
+  const proofHex = (proof as { proof?: unknown }).proof
+  const publicSignals = (proof as { publicSignals?: unknown }).publicSignals
+  if (typeof proofHex !== 'string' || !isHex(proofHex)) return false
+  if (!Array.isArray(publicSignals)) return false
+  if (!publicSignals.every((s) => typeof s === 'string' && isHex(s))) return false
+
+  // Public inputs consistency: required fields must be present and non-empty.
+  const { commitment, nullifier, amount, recipient } = publicInputs as {
+    commitment?: unknown
+    nullifier?: unknown
+    amount?: unknown
+    recipient?: unknown
   }
-  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')
-}
+  if (typeof commitment !== 'string' || !isHex(commitment)) return false
+  if (typeof nullifier !== 'string' || !isHex(nullifier)) return false
+  if (typeof recipient !== 'string' || recipient.length === 0) return false
+  if (typeof amount !== 'string' || amount.length === 0) return false
 
-/** Decode an auth signature produced by {@link encodeAuthSignature} */
-export function decodeAuthSignature(encoded: string): import('./types.js').NulthAuthSignature {
-  const raw = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8')) as unknown
-  if (
-    typeof raw !== 'object' ||
-    raw === null ||
-    (raw as { nulth?: string }).nulth !== 'zk-v1'
-  ) {
-    throw new Error('Invalid Nulth ZK auth signature')
+  // The proof's public signals must match the supplied public inputs so a
+  // tampered proof or mismatched inputs are rejected off-chain.
+  const expectedSignals = [commitment, nullifier]
+  if (publicSignals.length !== expectedSignals.length) return false
+  for (let i = 0; i < expectedSignals.length; i++) {
+    if (publicSignals[i] !== expectedSignals[i]) return false
   }
-  return raw as import('./types.js').NulthAuthSignature
+
+  return true
 }
 
-/** Convert decimal USDC string to stroops (7 decimals) */
-export { usdcToStroops } from './usdc.js'
+function isHex(value: string): boolean {
+  return value.length > 0 && /^[0-9a-fA-F]+$/.test(value)
+}

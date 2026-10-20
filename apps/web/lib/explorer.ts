@@ -26,6 +26,17 @@ function resolveNetwork(network?: string): 'mainnet' | 'testnet' {
   return configuredNetwork()
 }
 
+/**
+ * Normalize a raw `?network=` search param to a concrete network.
+ * Only 'mainnet' and 'testnet' are accepted; anything else (missing,
+ * empty, unknown) falls back to the configured network. Used by the
+ * dashboard network switcher to filter queries and render the badge.
+ */
+export function parseNetworkParam(value?: string | string[]): 'mainnet' | 'testnet' {
+  const raw = Array.isArray(value) ? value[0] : value
+  return resolveNetwork(raw)
+}
+
 /** Explorer home for a network, e.g. https://stellar.expert/explorer/public. */
 export function explorerHome(network?: string): string {
   return `https://stellar.expert/explorer/${resolveNetwork(network) === 'mainnet' ? 'public' : 'testnet'}`

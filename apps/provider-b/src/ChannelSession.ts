@@ -22,6 +22,15 @@ import type { Env } from './env.js'
 import { createSessionWriters } from './sessionWrites.js'
 import { resolveAssetContract } from './config.js'
 
+/**
+ * How long a successful provider registration is considered fresh. Within this
+ * window a Durable Object wake-up skips the Supabase upsert entirely (#110).
+ */
+const REGISTRATION_TTL_MS = 24 * 60 * 60 * 1000
+
+/** Durable Object storage key holding the last successful registration time. */
+const LAST_REGISTERED_AT_KEY = 'last_registered_at'
+
 interface OrderBookLevel {
   price: string
   amount: string
@@ -132,6 +141,12 @@ export class ChannelSession extends DurableObject<Env> {
   private app: Hono | null = null
 
   /**
+   * In-flight registration promise. Concurrent buildApp() calls on the same
+   * instance share this so overlapping wake-ups fire at most one upsert (#110).
+   */
+  private registrationInFlight: Promise<void> | null = null
+
+  /**
    * True while a reconciliation cycle is running. Durable Object input gates
    * only serialize storage operations — reconcileAbandonedSessions awaits
    * Supabase and Soroban RPC calls, during which the next 15-minute cron tick
@@ -139,6 +154,39 @@ export class ChannelSession extends DurableObject<Env> {
    * on-chain twice (#28).
    */
   private isReconciling = false
+
+  /**
+   * Register this provider with the registry, throttled to once per
+   * REGISTRATION_TTL_MS. Reads `last_registered_at` from Durable Object
+   * storage so the throttle survives hibernation and isolate eviction, and
+   * deduplicates concurrent attempts via `registrationInFlight`.
+   */
+  private async registerProviderThrottled(
+    supabase: SupabaseClient,
+    manifest: ReturnType<typeof buildManifest>,
+    baseUrl: string,
+    payeeSecret: string,
+  ): Promise<void> {
+    if (this.registrationInFlight) {
+      return this.registrationInFlight
+    }
+
+    const run = async (): Promise<void> => {
+      const lastRegisteredAt = await this.ctx.storage.get<number>(LAST_REGISTERED_AT_KEY)
+      if (typeof lastRegisteredAt === 'number' && Date.now() - lastRegisteredAt < REGISTRATION_TTL_MS) {
+        return
+      }
+
+      const signed = signManifest(manifest, payeeSecret)
+      await registerProvider({ supabase, manifest: signed, baseUrl, verified: true })
+      await this.ctx.storage.put(LAST_REGISTERED_AT_KEY, Date.now())
+    }
+
+    this.registrationInFlight = run().finally(() => {
+      this.registrationInFlight = null
+    })
+    return this.registrationInFlight
+  }
 
   private buildApp(): Hono {
     const env = this.env
@@ -167,9 +215,9 @@ export class ChannelSession extends DurableObject<Env> {
 
     if (supabase && env.STELLAR_PAYEE_SECRET) {
       const baseUrl = env.PUBLIC_BASE_URL ?? 'https://api-b.kikis-app.xyz'
-      const signed = signManifest(manifest, env.STELLAR_PAYEE_SECRET)
+      const payeeSecret = env.STELLAR_PAYEE_SECRET
       this.ctx.waitUntil(
-        registerProvider({ supabase, manifest: signed, baseUrl, verified: true }).catch((err) => {
+        this.registerProviderThrottled(supabase, manifest, baseUrl, payeeSecret).catch((err) => {
           console.error('[registry] Failed to register provider-b:', err)
         }),
       )
@@ -223,151 +271,6 @@ export class ChannelSession extends DurableObject<Env> {
         selling_asset_type: 'native',
         buying_asset_type: 'credit_alphanum4',
         buying_asset_code: 'USDC',
-        buying_asset_issuer: USDC_ISSUERS[network],
-        limit: '5',
-      })
-      const response = await fetch(`${HORIZON_URLS[network]}/order_book?${params.toString()}`, {
-        headers: { accept: 'application/json' },
-      })
-      if (!response.ok) throw new Error(`Horizon responded ${response.status}`)
-      const orderbook = (await response.json()) as OrderBookResponse
-      return {
-        pair: 'XLM/USDC',
-        timestamp: new Date().toISOString(),
-        source: 'stellar-dex',
-        network,
-        asks: orderbook.asks.slice(0, 5).map((a) => ({ price: a.price, amount: a.amount })),
-        bids: orderbook.bids.slice(0, 5).map((b) => ({ price: b.price, amount: b.amount })),
-      }
-    }
+        buying_asset_issuer: USDC_ISSUERS[networ
 
-    app.get(
-      '/stream/orderbook',
-      upgradeWebSocket((c) => {
-        // Hono runs this callback before it checks the Upgrade header, so a
-        // plain mpp-session GET lands here too. Return no events and let the
-        // helper fall through to the HTTP route below.
-        if (c.req.header('upgrade')?.toLowerCase() !== 'websocket') {
-          return {}
-        }
-        // Never upgrade a handshake the payment middleware did not verify.
-        // (The middleware returns 402 before reaching this route, so this is
-        // defense in depth against misconfiguration — fail fast rather than
-        // opening an unpaid socket.)
-        if (!mppSessionWsVerified(c)) {
-          throw new Error('mpp-session-ws: refusing unverified WebSocket handshake')
-        }
-
-        let pusher: { stop: () => void } | null = null
-
-        return {
-          onMessage: (evt, ws) => {
-            socket = ws
-            try {
-              const raw = typeof evt.data === 'string' ? evt.data : ''
-              const parsed = JSON.parse(raw)
-              if (parsed?.type === 'init') {
-                // Client initiation handshake received
-              }
-            } catch {
-              // Non-JSON or binary frame - ignore and proceed
-            }
-            // First message kicks off a periodic snapshot push. Cloudflare's
-            // WebSocketPair has no onOpen, so a client message is the natural
-            // trigger for the stream.
-            if (!pusher) {
-              pusher = startOrderbookPush(ws, fetchOrderbook)
-            }
-            void ws.send(JSON.stringify({ type: 'ack', at: new Date().toISOString() }))
-          },
-          onClose: () => {
-            pusher?.stop()
-          },
-          onError: () => {
-            // An unclean disconnect surfaces here when onClose never runs —
-            // guarantee the push interval is torn down either way (#27).
-            pusher?.stop()
-          },
-        }
-      }),
-    )
-
-    app.get('/stream/orderbook', async (c) => {
-      try {
-        return c.json(await fetchOrderbook())
-      } catch (err) {
-        console.error('[horizon] orderbook error:', err)
-        return c.json({ error: 'Upstream Horizon error' }, 502)
-      }
-    })
-
-    return app
-  }
-
-  async reconcileSessions(): Promise<ReconciliationStats | null> {
-    // Skip if the previous cycle is still running — a duplicate run would
-    // attempt to close channels the in-flight one is already settling.
-    if (this.isReconciling) {
-      console.warn('[reconcile] Skipped: previous run still in progress')
-      return {
-        orphanedCount: 0,
-        recoveredCount: 0,
-        skippedCount: 0,
-        failedCount: 0,
-        alreadyClosedCount: 0,
-        errors: [],
-      }
-    }
-    this.isReconciling = true
-    try {
-      return await this.runReconciliation()
-    } finally {
-      this.isReconciling = false
-    }
-  }
-
-  private async runReconciliation(): Promise<ReconciliationStats | null> {
-    const env = this.env
-    if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY || !env.STELLAR_PAYEE_SECRET) {
-      return null
-    }
-
-    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY)
-    const network: Network = env.STELLAR_NETWORK === 'mainnet' ? 'mainnet' : 'testnet'
-    const providerUrl = `${env.PUBLIC_BASE_URL ?? 'https://api-b.kikis-app.xyz'}/stream/orderbook`
-
-    return reconcileAbandonedSessions({
-      supabase,
-      network,
-      payeeSecretKey: env.STELLAR_PAYEE_SECRET,
-      onRecovered: async (channelId: string, txHash: string, totalPaid: string) => {
-        console.log(`[reconcile] Recovered channel ${channelId} with tx ${txHash} for ${totalPaid} USDC`)
-        const { error } = await supabase.from('tx_log').insert({
-          tx_type: 'channel_close',
-          tx_hash: txHash,
-          amount: parseFloat(totalPaid),
-          mode: 'mpp-session',
-          network,
-          provider_url: providerUrl,
-          metadata: { settled_at: new Date().toISOString(), recovered: true },
-        })
-        if (error) {
-          console.error('[supabase] tx_log insert on reconcile failed:', error.message)
-        }
-      },
-    })
-  }
-
-  override async fetch(request: Request): Promise<Response> {
-    if (!this.app) {
-      try {
-        this.app = this.buildApp()
-      } catch (err) {
-        console.error('[startup]', err)
-        return Response.json({ error: 'Provider misconfigured' }, { status: 500 })
-      }
-    }
-    return this.app.fetch(request)
-  }
-}
-
+/* … truncated 5188 chars — edit only what you need near the top … */

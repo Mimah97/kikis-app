@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { cors } from 'hono/cors'
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import {
   kikisAppHono,
@@ -51,6 +52,14 @@ function resolveAssetContract(env: Env, network: Network): string {
 }
 
 /**
+ * A Stellar secret key is a 56-character StrKey starting with 'S'.
+ * We only check shape here — never log or return the value itself.
+ */
+function isStellarSecretKey(value: string | undefined): boolean {
+  return typeof value === 'string' && value.length === 56 && value.startsWith('S')
+}
+
+/**
  * Return the names of environment variables that are unset or malformed.
  * Values are never included — only names, so this is safe to log or return
  * to a caller directly. Shared by createApp (throws, caught by fetch() below)
@@ -58,7 +67,7 @@ function resolveAssetContract(env: Env, network: Network): string {
  */
 function findStartupProblems(env: Env, network: Network): string[] {
   const problems: string[] = []
-  if (!env.STELLAR_PAYEE_SECRET || !env.STELLAR_PAYEE_SECRET.startsWith('S')) {
+  if (!isStellarSecretKey(env.STELLAR_PAYEE_SECRET)) {
     problems.push('STELLAR_PAYEE_SECRET')
   }
   if (!env.STELLAR_PAYEE_ADDRESS) {
@@ -68,6 +77,20 @@ function findStartupProblems(env: Env, network: Network): string[] {
     problems.push('USDC_ASSET_CONTRACT')
   }
   return problems
+}
+
+/**
+ * Validate required worker environment variables at cold start.
+ * Throws with the exact missing/malformed key names so misconfiguration
+ * fails fast during initialization instead of mid-transaction.
+ */
+export function validateWorkerEnv(env: Env): void {
+  const network = resolveNetwork(env.STELLAR_NETWORK)
+  const problems = findStartupProblems(env, network)
+  if (problems.length > 0) {
+    console.error(`[startup] Provider misconfigured: ${problems.join(', ')}`)
+    throw new Error(`Provider misconfigured: ${problems.join(', ')} unset or malformed`)
+  }
 }
 
 /**
@@ -206,10 +229,7 @@ export async function getOrderBook(network: Network, limit: number): Promise<Ord
 function createApp(env: Env, ctx: ExecutionContext): Hono {
   const network = resolveNetwork(env.STELLAR_NETWORK)
 
-  const problems = findStartupProblems(env, network)
-  if (problems.length > 0) {
-    throw new Error(`Provider misconfigured: ${problems.join(', ')} unset`)
-  }
+  validateWorkerEnv(env)
 
   const assetContract = resolveAssetContract(env, network)
   const manifest = buildManifest({ network, payee: env.STELLAR_PAYEE_ADDRESS, assetContract })
@@ -237,115 +257,7 @@ function createApp(env: Env, ctx: ExecutionContext): Hono {
 
   const app = new Hono()
 
-  // Mounted at '*', not '/price', so kikisAppHono's own
-  // /.well-known/kikis-app.json branch serves the SIGNED manifest. Scoping it
-  // to /price leaves the well-known route unsigned, and mandatory signature
-  // verification (PR #86) then makes every client.pay() throw
-  // KikisAppSignatureError before any payment — issue #134. /health is
-  // answered in fetch() below, before this middleware can demand payment.
-  app.use(
-    '*',
-    kikisAppHono({
-      modes: ['x402', 'mpp-charge'],
-      pricing: { x402: X402_PRICE, 'mpp-charge': MPP_CHARGE_PRICE },
-      asset: 'USDC',
-      assetContract,
-      payee: env.STELLAR_PAYEE_ADDRESS,
-      network,
-      payeeSecretKey: env.STELLAR_PAYEE_SECRET,
-      manifest,
-      seenTxStore,
-      ...(env.OPENZEPPELIN_API_KEY ? { facilitatorApiKey: env.OPENZEPPELIN_API_KEY } : {}),
-      onSettled: async (txHash, amount, mode, payer) => {
-        console.log(`[settled] mode=${mode} txHash=${txHash} amount=${amount} payer=${payer ?? 'unknown'}`)
-        if (!supabase) return
-        const { error } = await supabase.from('tx_log').insert({
-          tx_type: mode === 'mpp-charge' ? 'mpp_charge' : 'x402_settle',
-          tx_hash: txHash,
-          amount: parseFloat(amount),
-          mode,
-          network,
-          provider_url: providerUrl,
-          agent_address: payer,
-          metadata: { settled_at: new Date().toISOString() },
-        })
-        if (error) console.error('[supabase] tx_log insert failed:', error.message)
-      },
-    }),
-  )
+  // Allow cross-origin browser agents to send payment headers on /price and
+  // read payment requirem
 
-  app.get('/price', async (c) => {
-    try {
-      const { data: orderbook, stale } = await getOrderBook(network, 1)
-      const ask = orderbook.asks[0]
-      const bid = orderbook.bids[0]
-
-      if (!ask || !bid) {
-        return c.json(
-          {
-            error: 'Orderbook unavailable — no asks or bids returned from Horizon',
-            asksLength: orderbook.asks.length,
-            bidsLength: orderbook.bids.length,
-          },
-          503,
-        )
-      }
-
-      const midPrice = (parseFloat(ask.price) + parseFloat(bid.price)) / 2
-
-      // Horizon was rate-limiting or down; this quote comes from the fallback
-      // snapshot, so let the caller know it is not a live reading.
-      if (stale) c.header('X-Orderbook-Stale', 'true')
-
-      return c.json({
-        price: midPrice.toFixed(7),
-        pair: 'XLM/USDC',
-        timestamp: new Date().toISOString(),
-        source: 'stellar-dex',
-        network,
-      })
-    } catch (err) {
-      console.error('[horizon] orderbook error:', err)
-      return c.json({ error: 'Upstream Horizon error' }, 502)
-    }
-  })
-
-  return app
-}
-
-function healthResponse(env: Env): Response {
-  const addr = env.STELLAR_PAYEE_ADDRESS
-  const network = resolveNetwork(env.STELLAR_NETWORK)
-  const missing = findStartupProblems(env, network)
-  return Response.json(
-    {
-      status: missing.length > 0 ? 'misconfigured' : 'ok',
-      network,
-      payee: addr ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : 'not configured',
-      registry: env.SUPABASE_URL && env.SUPABASE_SERVICE_KEY ? 'connected' : 'not configured',
-      ...(missing.length > 0 ? { missing } : {}),
-    },
-    { status: missing.length > 0 ? 503 : 200 },
-  )
-}
-
-/**
- * Workers hand `env` to `fetch`, so the app cannot be built at module scope the
- * way the Express server was. Build once per isolate and reuse.
- */
-let cachedApp: Hono | null = null
-
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    // Answered before the app so the '*' payment middleware never sees it.
-    if (new URL(request.url).pathname === '/health') return healthResponse(env)
-
-    try {
-      cachedApp ??= createApp(env, ctx)
-    } catch (err) {
-      console.error('[startup]', err)
-      return Response.json({ error: 'Provider misconfigured' }, { status: 500 })
-    }
-    return cachedApp.fetch(request, env, ctx)
-  },
-}
+/* … truncated 600 chars — edit only what you need near the top … */

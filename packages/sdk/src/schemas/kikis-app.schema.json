@@ -11,7 +11,6 @@
     "modes",
     "network",
     "asset",
-    "asset_contract",
     "payee",
     "pricing",
     "endpoints",
@@ -74,7 +73,7 @@
     },
     "asset_contract": {
       "type": "string",
-      "description": "Stellar Asset Contract (SAC) address for the payment asset"
+      "description": "Stellar Asset Contract (SAC) address for the payment asset. Optional for native XLM, where it may be omitted or set to 'native'."
     },
     "assets": {
       "type": "array",
@@ -205,6 +204,34 @@
       "description": "Optional hierarchical categories from a published taxonomy (e.g. data/price/crypto)"
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "asset": { "const": "XLM" }
+        },
+        "required": ["asset"]
+      },
+      "then": {
+        "properties": {
+          "asset_contract": {
+            "type": "string",
+            "description": "Optional for native XLM: may be omitted or set to 'native'."
+          }
+        }
+      },
+      "else": {
+        "required": ["asset_contract"],
+        "properties": {
+          "asset_contract": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stellar Asset Contract (SAC) address for the payment asset"
+          }
+        }
+      }
+    }
+  ],
   "definitions": {
     "VaultMode": {
       "type": "string",
@@ -219,7 +246,7 @@
     "AssetConfig": {
       "type": "object",
       "description": "Payment asset configuration with optional mode and endpoint scoping",
-      "required": ["asset", "asset_contract"],
+      "required": ["asset"],
       "additionalProperties": false,
       "properties": {
         "asset": {
@@ -228,7 +255,7 @@
         },
         "asset_contract": {
           "type": "string",
-          "description": "Stellar Asset Contract (SAC) address for the payment asset"
+          "description": "Stellar Asset Contract (SAC) address for the payment asset. Optional for native XLM, where it may be omitted or set to 'native'."
         },
         "modes": {
           "type": "array",
@@ -244,149 +271,37 @@
             "type": "string"
           },
           "uniqueItems": true,
-          "description": "Optional: restrict this asset to specific endpoints (by name). If omitted, available for all endpoints."
+          "description": "Optional: restrict this asset to specific endpoints. If omitted, available for all endpoints."
         }
-      }
-    },
-    "PricingConfig": {
-      "type": "object",
-      "description": "Per-request pricing for x402 or mpp-charge modes",
-      "required": ["amount", "per"],
-      "additionalProperties": false,
-      "properties": {
-        "amount": {
-          "type": "string",
-          "description": "Cost per request in the payment asset (decimal string, e.g. '0.001')"
-        },
-        "per": {
-          "type": "string",
-          "const": "request",
-          "description": "Billing unit — always 'request' for non-session modes"
-        },
-        "facilitator": {
-          "type": "string",
-          "description": "x402 facilitator URL (required for x402 mode). OpenZeppelin Channels endpoint."
-        },
-        "payee": {
-          "type": "string",
-          "description": "Optional per-mode payee override (Stellar G... address). Directs settlements for this mode to a separate account for treasury separation. Falls back to the top-level 'payee' when omitted."
-        }
-      }
-    },
-    "SessionPricingConfig": {
-      "type": "object",
-      "description": "Per-voucher pricing for mpp-session (one-way-channel) mode",
-      "required": ["rate", "per", "channel_factory", "min_deposit", "refund_waiting_period_ledgers"],
-      "additionalProperties": false,
-      "properties": {
-        "rate": {
-          "type": "string",
-          "description": "Cost per voucher in the payment asset (decimal string, e.g. '0.0001')"
-        },
-        "per": {
-          "type": "string",
-          "const": "voucher",
-          "description": "Billing unit — always 'voucher' for session mode"
-        },
-        "channel_factory": {
-          "type": "string",
-          "description": "Stable Soroban factory address (C...) used to deploy a per-session channel"
-        },
-        "min_deposit": {
-          "type": "string",
-          "description": "Minimum initial deposit to open a channel (decimal string)"
-        },
-        "refund_waiting_period_ledgers": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Ledgers the server has to settle before the funder can reclaim. Default: 17280 (~24h). Do not reduce in production."
-        }
-      }
-    },
-    "SLAConfig": {
-      "type": "object",
-      "description": "Service Level Agreement for the provider",
-      "required": ["uptime_30d_percent", "p95_latency_ms"],
-      "additionalProperties": false,
-      "properties": {
-        "uptime_30d_percent": {
-          "type": "number",
-          "description": "Uptime percentage over the last 30 days"
-        },
-        "p95_latency_ms": {
-          "type": "number",
-          "description": "P95 latency in milliseconds"
-        },
-        "maintenance_windows": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["cron", "duration_minutes"],
-            "additionalProperties": false,
+      },
+      "allOf": [
+        {
+          "if": {
             "properties": {
-              "cron": {
+              "asset": { "const": "XLM" }
+            },
+            "required": ["asset"]
+          },
+          "then": {
+            "properties": {
+              "asset_contract": {
                 "type": "string",
-                "description": "Cron expression for the maintenance window"
-              },
-              "duration_minutes": {
-                "type": "number",
-                "description": "Duration of the maintenance window in minutes"
+                "description": "Optional for native XLM: may be omitted or set to 'native'."
+              }
+            }
+          },
+          "else": {
+            "required": ["asset_contract"],
+            "properties": {
+              "asset_contract": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Stellar Asset Contract (SAC) address for the payment asset"
               }
             }
           }
         }
-      }
-    },
-    "EndpointDescriptor": {
-      "type": "object",
-      "description": "Descriptor for a provider endpoint",
-      "required": ["method", "path"],
-      "additionalProperties": false,
-      "properties": {
-        "method": {
-          "type": "string",
-          "description": "HTTP method for the endpoint"
-        },
-        "path": {
-          "type": "string",
-          "description": "Path for the endpoint"
-        },
-        "deprecated": {
-          "type": "boolean",
-          "description": "Whether this endpoint is retained only for backwards compatibility"
-        },
-        "sunset_at": {
-          "type": "string",
-          "format": "date-time",
-          "description": "ISO 8601 timestamp after which callers should stop using this endpoint"
-        },
-        "headers": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "description": "Expected request headers"
-        },
-        "request_schema": {
-          "description": "JSON schema for the request body"
-        },
-        "response_schema": {
-          "description": "JSON schema for the response body"
-        },
-        "rate_limit": {
-          "type": "object",
-          "required": ["requests", "window_seconds"],
-          "additionalProperties": false,
-          "properties": {
-            "requests": {
-              "type": "number"
-            },
-            "window_seconds": {
-              "type": "number"
-            }
-          }
-        }
-      }
+      ]
     }
   }
 }

@@ -23,6 +23,116 @@ const SUPABASE_SERVICE_KEY = process.env['SUPABASE_SERVICE_KEY'] ?? ''
 const STELLAR_NETWORK = (process.env['STELLAR_NETWORK'] ?? 'testnet') as 'testnet' | 'mainnet'
 const STELLAR_PAYEE_SECRET = process.env['STELLAR_PAYEE_SECRET'] ?? ''
 
+/**
+ * Minimal shape of an active MPP session handle that can be settled on shutdown.
+ * Matches the `SessionHandle` returned by `client.openSession()`.
+ */
+export interface ActiveSession {
+  channelId: string
+  close: () => Promise<unknown>
+}
+
+/** Timeout applied to each best-effort session close during shutdown. */
+const SESSION_CLOSE_TIMEOUT_MS = 5_000
+
+/**
+ * Registry of active sessions opened by the agent runner. Sessions are added
+ * when opened and removed once closed so shutdown only touches live channels.
+ */
+const activeSessions = new Map<string, ActiveSession>()
+
+/** Register a session so it can be settled on process shutdown. */
+export function trackSession(session: ActiveSession): void {
+  activeSessions.set(session.channelId, session)
+}
+
+/** Remove a session from the registry (e.g. after a normal close). */
+export function untrackSession(channelId: string): void {
+  activeSessions.delete(channelId)
+}
+
+/**
+ * Best-effort settlement of all active sessions. Each close is bounded by a
+ * 5-second timeout so a hung channel cannot block process termination.
+ * Returns the number of sessions that were closed successfully.
+ */
+export async function closeAllSessions(): Promise<number> {
+  const sessions = Array.from(activeSessions.values())
+  if (sessions.length === 0) {
+    return 0
+  }
+
+  console.log(`[SessionCleanup] Closing ${sessions.length} active session(s)...`)
+
+  let closed = 0
+  await Promise.all(
+    sessions.map(async (session) => {
+      try {
+        await Promise.race([
+          session.close(),
+          new Promise((_, reject) =>
+            setTimeout(
+              () => reject(new Error('close timed out')),
+              SESSION_CLOSE_TIMEOUT_MS,
+            ),
+          ),
+        ])
+        activeSessions.delete(session.channelId)
+        closed += 1
+        console.log(`[SessionCleanup] Closed channel ${session.channelId}`)
+      } catch (err) {
+        console.error(
+          `[SessionCleanup] Failed to close channel ${session.channelId}:`,
+          err instanceof Error ? err.message : err,
+        )
+      }
+    }),
+  )
+
+  console.log(
+    `[SessionCleanup] Recovered collateral from ${closed}/${sessions.length} session(s)`,
+  )
+  return closed
+}
+
+let shutdownInProgress = false
+
+/**
+ * Graceful shutdown: settle all active sessions, then exit. Guarded so that
+ * overlapping signals or an uncaught exception do not trigger double-close.
+ */
+async function gracefulShutdown(reason: string, exitCode: number): Promise<void> {
+  if (shutdownInProgress) {
+    return
+  }
+  shutdownInProgress = true
+
+  console.log(`[SessionCleanup] Received ${reason}, settling active sessions...`)
+  try {
+    await closeAllSessions()
+  } catch (err) {
+    console.error('[SessionCleanup] Unexpected error during cleanup:', err)
+  }
+  process.exit(exitCode)
+}
+
+/**
+ * Install process exit handlers so open channels are settled before the agent
+ * terminates. Safe to call multiple times; handlers are registered once.
+ */
+export function registerShutdownHandlers(): void {
+  process.once('SIGINT', () => {
+    void gracefulShutdown('SIGINT', 0)
+  })
+  process.once('SIGTERM', () => {
+    void gracefulShutdown('SIGTERM', 0)
+  })
+  process.once('uncaughtException', (err) => {
+    console.error('[SessionCleanup] Uncaught exception:', err)
+    void gracefulShutdown('uncaughtException', 1)
+  })
+}
+
 async function main(): Promise<void> {
   // Validation
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {

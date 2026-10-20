@@ -146,6 +146,26 @@ export function selectAsset(
 }
 
 /**
+ * Selects the first eligible asset that passes the supplied predicate,
+ * iterating in manifest preference order. Used for dynamic asset fallback
+ * negotiation (#99): when the primary asset fails a wallet preflight check
+ * (e.g. missing trustline or insufficient balance), the next eligible asset
+ * is tried instead of aborting.
+ *
+ * Returns the first passing asset, or `undefined` when none pass. Callers are
+ * responsible for surfacing a combined error listing all attempted assets.
+ */
+export function selectAssetWithFallback(
+  manifest: KikisAppManifest,
+  mode: PaymentMode,
+  endpoint: string | undefined,
+  isEligible: (asset: AssetConfig) => boolean,
+): AssetConfig | undefined {
+  const eligible = getEligibleAssets(manifest, mode, endpoint)
+  return eligible.find((asset) => isEligible(asset))
+}
+
+/**
  * Checks if a specific asset (by ticker or contract address) is eligible for a mode/endpoint.
  */
 export function isAssetEligible(

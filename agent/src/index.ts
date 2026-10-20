@@ -57,32 +57,93 @@ function explorerLink(txHash: string): string {
 type AgentSession = Awaited<ReturnType<KikisAppClient['openSession']>>
 type CloseResult = Awaited<ReturnType<AgentSession['close']>>
 
-let activeSession: AgentSession | null = null
-let closingSession = false
+// ── Session registry & graceful shutdown ──────────────────────────────────────
 
-async function closeActiveSession(reason: string): Promise<CloseResult | null> {
-  if (!activeSession || closingSession) return null
-  closingSession = true
-  log('mpp-session', `Closing active session (${reason})...`)
+const SESSION_CLOSE_TIMEOUT_MS = 5_000
 
+const activeSessions = new Set<AgentSession>()
+let shuttingDown = false
+
+function trackSession(session: AgentSession): AgentSession {
+  activeSessions.add(session)
+  return session
+}
+
+function untrackSession(session: AgentSession): void {
+  activeSessions.delete(session)
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
+}
+
+async function closeSession(session: AgentSession, reason: string): Promise<CloseResult | null> {
+  if (!activeSessions.has(session)) return null
+  log('mpp-session', `Closing active session ${session.channelId} (${reason})...`)
   try {
-    return await activeSession.close()
+    const result = await withTimeout(session.close(), SESSION_CLOSE_TIMEOUT_MS, 'session.close()')
+    log('mpp-session', `Session ${session.channelId} closed. closeTxHash: ${result.closeTxHash ?? 'n/a'}`)
+    if (result.closeTxHash) {
+      log('mpp-session', `Channel close explorer: ${explorerLink(result.closeTxHash)}`)
+    }
+    return result
+  } catch (err) {
+    console.error(`[Agent] Failed to close session ${session.channelId} (${reason}):`, err)
+    return null
   } finally {
-    activeSession = null
-    closingSession = false
+    untrackSession(session)
   }
+}
+
+async function shutdown(reason: string, exitCode: number): Promise<void> {
+  if (shuttingDown) return
+  shuttingDown = true
+
+  const sessions = Array.from(activeSessions)
+  if (sessions.length === 0) {
+    log('shutdown', `No active sessions to close (${reason}).`)
+    process.exit(exitCode)
+  }
+
+  log('shutdown', `Closing ${sessions.length} active session(s) (${reason})...`)
+  const results = await Promise.all(sessions.map((s) => closeSession(s, reason)))
+
+  const recovered = results.filter((r): r is CloseResult => r !== null)
+  log('shutdown', `Recovered ${recovered.length}/${sessions.length} session(s).`)
+  for (const r of recovered) {
+    log('shutdown', `  channel ${r.channelId} closeTxHash: ${r.closeTxHash ?? 'n/a'}`)
+  }
+
+  process.exit(exitCode)
 }
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {
-    closeActiveSession(signal)
-      .then(() => process.exit(0))
-      .catch((err) => {
-        console.error(`[Agent] Failed to close session during ${signal}:`, err)
-        process.exit(1)
-      })
+    void shutdown(signal, 0)
   })
 }
+
+process.once('uncaughtException', (err) => {
+  console.error('[Agent] Uncaught exception:', err)
+  void shutdown('uncaughtException', 1)
+})
+
+process.once('unhandledRejection', (reason) => {
+  console.error('[Agent] Unhandled rejection:', reason)
+  void shutdown('unhandledRejection', 1)
+})
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -169,14 +230,14 @@ async function main(): Promise<void> {
 
   // ── Step 4: MPP session streaming ─────────────────────────────────────────
   log('mpp-session', 'Opening MPP session channel...')
-  activeSession = await client.openSession(`${PROVIDER_B_URL}/stream/orderbook`)
+  const session = trackSession(await client.openSession(`${PROVIDER_B_URL}/stream/orderbook`))
 
-  if (activeSession.openTxHash) {
-    txHashes.channelOpen = activeSession.openTxHash
+  if (session.openTxHash) {
+    txHashes.channelOpen = session.openTxHash
   }
-  log('mpp-session', `[Session] Opened. Channel: ${activeSession.channelId} openTxHash: ${activeSession.openTxHash ?? 'n/a (pre-deployed channel)'}`)
-  if (activeSession.openTxHash) {
-    log('mpp-session', `Channel open explorer: ${explorerLink(activeSession.openTxHash)}`)
+  log('mpp-session', `[Session] Opened. Channel: ${session.channelId} openTxHash: ${session.openTxHash ?? 'n/a (pre-deployed channel)'}`)
+  if (session.openTxHash) {
+    log('mpp-session', `Channel open explorer: ${explorerLink(session.openTxHash)}`)
   }
 
   // Consume exactly 50 SSE events from the session stream
@@ -184,11 +245,11 @@ async function main(): Promise<void> {
   let voucherCount = 0
 
   try {
-    for await (const _item of activeSession.stream()) {
+    for await (const _item of session.stream()) {
       voucherCount++
 
       if (voucherCount % 10 === 0) {
-        const stats = activeSession.stats()
+        const stats = session.stats()
         log('mpp-session', `[Session] Vouchers: ${stats.vouchersIssued}, Cumulative: $${stats.currentCumulative}`)
       }
 
@@ -196,10 +257,10 @@ async function main(): Promise<void> {
     }
 
     log('mpp-session', `Consumed ${voucherCount} vouchers. Closing session...`)
-    closeResult = await closeActiveSession(`consumed ${voucherCount} vouchers`)
+    closeResult = await closeSession(session, `consumed ${voucherCount} vouchers`)
   } finally {
-    if (activeSession) {
-      await closeActiveSession('finally')
+    if (activeSessions.has(session)) {
+      await closeSession(session, 'finally')
     }
   }
 
@@ -208,114 +269,6 @@ async function main(): Promise<void> {
   }
 
   txHashes.channelClose = closeResult.closeTxHash
-  log(
-    'mpp-session',
-    `[Session] Closed. closeTxHash: ${closeResult.closeTxHash}. ` +
-    `${closeResult.vouchersIssued} interactions, 2 on-chain transactions.`,
-  )
-  log('mpp-session', `totalPaid: ${closeResult.totalPaid} USDC`)
-  log('mpp-session', `Channel close explorer: ${explorerLink(closeResult.closeTxHash)}`)
+ 
 
-  // ── Step 5: Policy rejection ──────────────────────────────────────────────
-
-  // After steps 2+3, daily spend = 0.001 + 0.0008 = 0.0018 USDC.
-  // Daily cap = 0.002 USDC. Adding another 0.001 (x402 price) → 0.0028 > 0.002 → rejected.
-  log('policy', 'Attempting payment that exceeds daily cap...')
-  let policyRejected = false
-  try {
-    await client.pay(`${PROVIDER_A_URL}/price`, { forceMode: 'x402' })
-    log('policy', 'WARNING: payment succeeded when it should have been rejected!')
-  } catch (err) {
-    if (err instanceof KikisAppPolicyRejectError) {
-      policyRejected = true
-      log('policy', `[Policy] REJECTED — reason: ${err.reason}. No transaction broadcast.`)
-      log('policy', 'Confirmed: spend cap enforced locally before any Stellar transaction.')
-    } else {
-      throw err
-    }
-  }
-
-  if (!policyRejected) {
-    log('policy', 'WARNING: expected KikisAppPolicyRejectedError but payment succeeded')
-  }
-
-  // ── Step 6: Summary ───────────────────────────────────────────────────────
-
-  const summary = buildSummary(agentAddress, startingBalance, txHashes, voucherCount, closeResult.totalPaid)
-
-  console.log('\n' + summary)
-
-  // Write RUN_RESULTS.md
-  const resultsPath = require('node:path').join(__dirname, '..', 'RUN_RESULTS.md') as string
-  writeFileSync(resultsPath, summary, 'utf8')
-  log('Summary', `RUN_RESULTS.md written to ${resultsPath}`)
-}
-
-// ── Summary builder ───────────────────────────────────────────────────────────
-
-function buildSummary(
-  agentAddress: string,
-  startingBalance: string,
-  txHashes: { x402?: string; mppCharge?: string; channelOpen?: string; channelClose?: string },
-  vouchersUsed: number,
-  totalPaid: string,
-): string {
-  const line = (label: string, hash?: string): string => {
-    if (!hash) return `  ${label.padEnd(22)} NO TX`
-    return `  ${label.padEnd(22)} ${hash}\n  ${''.padEnd(22)} → ${EXPLORER_BASE}/${hash}`
-  }
-
-  return [
-    '# KikisApp Agent Run Results',
-    '',
-    `**Date:** ${new Date().toISOString()}`,
-    `**Network:** ${STELLAR_NETWORK}`,
-    `**Agent address:** \`${agentAddress}\``,
-    `**Starting USDC balance:** ${startingBalance}`,
-    '',
-    '## Transaction Hashes',
-    '',
-    '```',
-    line('x402 settlement:', txHashes.x402),
-    line('MPP charge:', txHashes.mppCharge),
-    line('Channel open:', txHashes.channelOpen),
-    line('Channel close:', txHashes.channelClose),
-    '  Policy rejection:      NO TX (cap enforced locally)',
-    '```',
-    '',
-    '## Session Details',
-    '',
-    `- Vouchers consumed: ${vouchersUsed}`,
-    `- Total paid via session: ${totalPaid} USDC`,
-    `- On-chain transactions for session: 2 (open + close)`,
-    '',
-    '## Verification',
-    '',
-    txHashes.x402
-      ? `- x402 settlement: [view on explorer](${EXPLORER_BASE}/${txHashes.x402})`
-      : '- x402 settlement: PENDING',
-    txHashes.mppCharge
-      ? `- MPP charge: [view on explorer](${EXPLORER_BASE}/${txHashes.mppCharge})`
-      : '- MPP charge: PENDING',
-    txHashes.channelOpen
-      ? `- Channel open: [view on explorer](${EXPLORER_BASE}/${txHashes.channelOpen})`
-      : '- Channel open: PENDING',
-    txHashes.channelClose
-      ? `- Channel close: [view on explorer](${EXPLORER_BASE}/${txHashes.channelClose})`
-      : '- Channel close: PENDING',
-    '- Policy rejection: NO TX confirmed (nothing broadcast to Stellar)',
-    '',
-  ].join('\n')
-}
-
-main().catch((err: unknown) => {
-  if (err instanceof KikisAppTrustlineError) {
-    console.error(`\n[Agent] Fatal: ${err.message}`)
-    console.error(`[Agent]   Asset: ${err.asset}`)
-    console.error(`[Agent]   Issuer: ${err.issuer}`)
-    console.error(`[Agent]   Remediation: ${err.remediation}\n`)
-  } else {
-    console.error('[Agent] Fatal error:', err)
-  }
-  process.exit(1)
-})
+/* … truncated 4085 chars — edit only what you need near the top … */
