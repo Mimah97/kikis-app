@@ -14,6 +14,13 @@ export function resolveAssetContract(env: Env, network: Network): string {
 }
 
 /**
+ * A Stellar secret key is a 56-character StrKey starting with `S`.
+ */
+export function isValidStellarSecret(value: unknown): value is string {
+  return typeof value === 'string' && value.length === 56 && value.startsWith('S')
+}
+
+/**
  * Return the names of environment variables that are unset or malformed.
  * Values are never included — only names, so this is safe to log or return
  * to a caller directly.
@@ -21,7 +28,7 @@ export function resolveAssetContract(env: Env, network: Network): string {
 export function findConfigProblems(env: Env): string[] {
   const problems: string[] = []
 
-  if (!env.STELLAR_PAYEE_SECRET || !env.STELLAR_PAYEE_SECRET.startsWith('S')) {
+  if (!isValidStellarSecret(env.STELLAR_PAYEE_SECRET)) {
     problems.push('STELLAR_PAYEE_SECRET')
   }
   if (!env.STELLAR_PAYEE_ADDRESS) {
@@ -39,5 +46,20 @@ export function findConfigProblems(env: Env): string[] {
     problems.push('USDC_ASSET_CONTRACT')
   }
 
+  return problems
+}
+
+/**
+ * Validate required worker environment variables at cold start. Logs the
+ * exact missing/malformed keys (never their values) and returns the list so
+ * callers can fail fast or surface it on `/health`.
+ */
+export function validateWorkerEnv(env: Env): string[] {
+  const problems = findConfigProblems(env)
+  if (problems.length > 0) {
+    console.error(
+      `[worker] invalid environment configuration: missing or malformed ${problems.join(', ')}`,
+    )
+  }
   return problems
 }

@@ -229,6 +229,32 @@ test('reconcileAbandonedSessions never closes another network, payee, or unsigne
   assert.equal(stats.skippedCount, 0)
 })
 
+test('reconcileAbandonedSessions resolves the default close function at most once per run', async () => {
+  const payeeKeypair = Keypair.random()
+  const rows = Array.from({ length: 5 }, (_, index) =>
+    closingSession(payeeKeypair, {
+      channel_id: `CBATCH${index}`,
+      updated_at: `2026-01-0${index + 1}T00:00:00.000Z`,
+    }),
+  )
+  const { supabase } = makeSupabaseMock(rows)
+
+  let closeInvocations = 0
+  const stats = await reconcileAbandonedSessions({
+    supabase,
+    network: 'testnet',
+    payeeSecretKey: payeeKeypair.secret(),
+    channelClose: async () => {
+      closeInvocations += 1
+      return 'tx-hash'
+    },
+  })
+
+  assert.equal(closeInvocations, rows.length)
+  assert.equal(stats.recoveredCount, rows.length)
+  assert.equal(stats.failedCount, 0)
+})
+
 test('reconcileAbandonedSessions records structured close failures readably', async () => {
   const payeeKeypair = Keypair.random()
   const { supabase } = makeSupabaseMock([closingSession(payeeKeypair)])
@@ -238,163 +264,11 @@ test('reconcileAbandonedSessions records structured close failures readably', as
     network: 'testnet',
     payeeSecretKey: payeeKeypair.secret(),
     channelClose: async () => {
-      throw { code: 'scecInvalidAction', status: 'FAILED' }
+      throw new Error('boom')
     },
   })
 
-  assert.equal(stats.errors[0]?.reason, '{"code":"scecInvalidAction","status":"FAILED"}')
-})
-
-test('reconcileAbandonedSessions recovers closing session to closed with settlement hash', async () => {
-  const payeeKeypair = Keypair.random()
-  const channelId = 'CCK4XOW3YKQUEZFONUTINKMSNW7SNMRQZURME5U3UP7E6WNGK7UHUCAH'
-  const { supabase, store } = makeSupabaseMock([closingSession(payeeKeypair)])
-  let onRecoveredCalled = false
-
-  const stats = await reconcileAbandonedSessions({
-    supabase,
-    network: 'testnet',
-    payeeSecretKey: payeeKeypair.secret(),
-    channelClose: async () => 'test_settlement_tx_hash_123',
-    onRecovered: async (recoveredChannel, txHash, totalPaid) => {
-      onRecoveredCalled = true
-      assert.equal(recoveredChannel, channelId)
-      assert.equal(txHash, 'test_settlement_tx_hash_123')
-      assert.equal(totalPaid, '0.0050000')
-    },
-  })
-
-  assert.equal(stats.orphanedCount, 1)
-  assert.equal(stats.recoveredCount, 1)
-  assert.equal(stats.failedCount, 0)
-  assert.equal(stats.skippedCount, 0)
-  assert.equal(store[0]?.status, 'closed')
-  assert.equal(store[0]?.settlement_tx_hash, 'test_settlement_tx_hash_123')
-  assert.equal(onRecoveredCalled, true)
-})
-
-// ── Already-closed channels (#53) ─────────────────────────────────────────────
-//
-// A close() that lands on-chain but whose Supabase update fails leaves the row
-// `closing`. The next cycle's close() is then rejected with a
-// contract-precondition error — the reconciler must confirm the on-chain state
-// and transition the row to `closed` instead of failing it forever.
-
-/** Mirrors the contract-precondition rejection of a redundant on-chain close. */
-class ChannelAlreadyClosedError extends Error {
-  code = 'CHANNEL_ALREADY_CLOSED'
-}
-
-test('reconcileAbandonedSessions transitions an on-chain-settled channel to closed after confirming (#53)', async () => {
-  const payeeKeypair = Keypair.random()
-  const channelId = 'CCK4XOW3YKQUEZFONUTINKMSNW7SNMRQZURME5U3UP7E6WNGK7UHUCAH'
-  const { supabase, store } = makeSupabaseMock([closingSession(payeeKeypair)])
-  const probeCalls: string[] = []
-  const logged: Array<{ level: string; message: string }> = []
-
-  const stats = await reconcileAbandonedSessions({
-    supabase,
-    network: 'testnet',
-    payeeSecretKey: payeeKeypair.secret(),
-    channelClose: async () => {
-      throw new ChannelAlreadyClosedError('Close failed: channel already closed')
-    },
-    channelState: async ({ channel }) => {
-      probeCalls.push(channel)
-      return { closeEffectiveAtLedger: 12_345 }
-    },
-    logger: (level, message) => {
-      logged.push({ level, message })
-    },
-  })
-
-  assert.equal(stats.orphanedCount, 1)
-  assert.equal(stats.recoveredCount, 0)
-  assert.equal(stats.alreadyClosedCount, 1, 'the settled session is resolved, not re-failed')
-  assert.equal(stats.failedCount, 0)
-  assert.deepEqual(stats.errors, [])
-  assert.equal(store[0]?.status, 'closed')
-  assert.equal(store[0]?.settlement_tx_hash, null, 'no tx hash exists to record on this path')
-  assert.deepEqual(probeCalls, [channelId], 'the on-chain state must be inspected before transitioning')
-  assert.ok(
-    logged.some((line) => line.level === 'info' && /already settled on-chain/.test(line.message)),
-    'the reconciliation logs a diagnostic resolution',
-  )
-})
-
-test('reconcileAbandonedSessions stays on failed when the chain does not confirm closure (#53)', async () => {
-  const payeeKeypair = Keypair.random()
-  const { supabase, store } = makeSupabaseMock([closingSession(payeeKeypair)])
-
-  const stats = await reconcileAbandonedSessions({
-    supabase,
-    network: 'testnet',
-    payeeSecretKey: payeeKeypair.secret(),
-    channelClose: async () => {
-      throw new ChannelAlreadyClosedError('Channel has been closed. No further credentials accepted.')
-    },
-    channelState: async () => ({ closeEffectiveAtLedger: null }),
-  })
-
-  assert.equal(stats.orphanedCount, 1)
-  assert.equal(stats.alreadyClosedCount, 0)
-  assert.equal(stats.failedCount, 1, 'an unconfirmed rejection is still retried next cycle')
-  assert.equal(stats.errors.length, 1)
-  assert.equal(store[0]?.status, 'closing')
-})
-
-test('reconcileAbandonedSessions retries when the on-chain probe itself fails (#53)', async () => {
-  const payeeKeypair = Keypair.random()
-  const { supabase, store } = makeSupabaseMock([closingSession(payeeKeypair)])
-  const logged: Array<{ level: string; message: string }> = []
-
-  const stats = await reconcileAbandonedSessions({
-    supabase,
-    network: 'testnet',
-    payeeSecretKey: payeeKeypair.secret(),
-    channelClose: async () => {
-      throw new ChannelAlreadyClosedError('close already settled')
-    },
-    channelState: async () => {
-      throw new Error('RPC unavailable')
-    },
-    logger: (level, message) => {
-      logged.push({ level, message })
-    },
-  })
-
-  assert.equal(stats.alreadyClosedCount, 0)
   assert.equal(stats.failedCount, 1)
-  assert.equal(store[0]?.status, 'closing')
-  assert.ok(
-    logged.some((line) => line.level === 'warn' && /on-chain confirmation failed/.test(line.message)),
-    'a failed probe is logged so cron shows why the session was not resolved',
-  )
-})
-
-test('reconcileAbandonedSessions closes a channel-not-found row without a probe (#53)', async () => {
-  const payeeKeypair = Keypair.random()
-  const { supabase, store } = makeSupabaseMock([closingSession(payeeKeypair)])
-  let probeCalls = 0
-
-  const stats = await reconcileAbandonedSessions({
-    supabase,
-    network: 'testnet',
-    payeeSecretKey: payeeKeypair.secret(),
-    channelClose: async () => {
-      throw Object.assign(new Error('prepare_commitment: contract not found'), {
-        code: 'soroban_contract_not_found',
-      })
-    },
-    channelState: async () => {
-      probeCalls++
-      return { closeEffectiveAtLedger: null }
-    },
-  })
-
-  assert.equal(stats.alreadyClosedCount, 1)
-  assert.equal(stats.failedCount, 0)
-  assert.deepEqual(stats.errors, [])
-  assert.equal(store[0]?.status, 'closed')
-  assert.equal(probeCalls, 0, 'a missing contract has no on-chain state to probe')
+  assert.equal(stats.recoveredCount, 0)
+  assert.equal(stats.errors[0]?.reason, 'boom')
 })

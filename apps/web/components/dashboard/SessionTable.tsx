@@ -1,21 +1,6 @@
-'use client'
+'use client';
 
-import { useEffect, useState, useCallback } from 'react'
-import { getSupabaseBrowserClient, SESSION_COLUMNS, type Session } from '@/lib/supabase'
-import { AddressDisplay } from '@/components/shared/AddressDisplay'
-import { ModeBadge } from '@/components/shared/ModeBadge'
-import { RelativeTime } from '@/components/shared/RelativeTime'
-import { TxHashLink } from '@/components/shared/TxHashLink'
-import { Badge } from '@/components/ui/badge'
-import { cn } from '@/lib/utils'
-
-type StatusVariant = 'success' | 'warning' | 'neutral'
-
-const STATUS_VARIANT: Record<Session['status'], StatusVariant> = {
-  open: 'success',
-  closing: 'warning',
-  closed: 'neutral',
-}
+const PAGE_SIZE = 50
 
 interface SessionTableProps {
   initialSessions?: Session[]
@@ -24,6 +9,8 @@ interface SessionTableProps {
 export function SessionTable({ initialSessions = [] }: SessionTableProps) {
   const [sessions, setSessions] = useState<Session[]>(initialSessions)
   const [refreshFailed, setRefreshFailed] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [hasMore, setHasMore] = useState(initialSessions.length >= PAGE_SIZE)
 
   const refreshSessions = useCallback(async () => {
     const supabase = getSupabaseBrowserClient()
@@ -31,7 +18,7 @@ export function SessionTable({ initialSessions = [] }: SessionTableProps) {
       .from('public_sessions')
       .select(SESSION_COLUMNS)
       .order('opened_at', { ascending: false })
-      .limit(50)
+      .limit(PAGE_SIZE)
 
     if (error) {
       // Keep the rows already on screen instead of blanking the table.
@@ -40,56 +27,114 @@ export function SessionTable({ initialSessions = [] }: SessionTableProps) {
       return
     }
     setRefreshFailed(false)
-    if (data) setSessions(data as Session[])
+    if (data) {
+      setSessions(data as Session[])
+      setHasMore(data.length >= PAGE_SIZE)
+    }
   }, [])
 
-  useEffect(() => {
-    const initialRefresh = setTimeout(() => void refreshSessions(), 0)
-    const interval = setInterval(() => void refreshSessions(), 10_000)
-    return () => {
-      clearTimeout(initialRefresh)
-      clearInterval(interval)
+  const loadMore = useCallback(async () => {
+    const cursor = sessions[sessions.length - 1]?.opened_at
+    if (!cursor || loadingMore) return
+
+    setLoadingMore(true)
+    const supabase = getSupabaseBrowserClient()
+    const { data, error } = await supabase
+      .from('public_sessions')
+      .select(SESSION_COLUMNS)
+      .lt('opened_at', cursor)
+      .order('opened_at', { ascending: false })
+      .limit(PAGE_SIZE)
+
+    if (error) {
+      console.warn('[sessions] failed to load more public_sessions:', error.message)
+      setRefreshFailed(true)
+      setLoadingMore(false)
+      return
     }
-  }, [refreshSessions])
+
+    const batch = (data ?? []) as Session[]
+    setSessions((prev) => {
+      const seen = new Set(prev.map((s) => s.id))
+      return [...prev, ...batch.filter((s) => !seen.has(s.id))]
+    })
+    setHasMore(batch.length >= PAGE_SIZE)
+    setLoadingMore(false)
+  }, [sessions, loadingMore])
+
+  useEffect(() => {
+    if (!configured) return;
+
+    const supabase = getSupabaseBrowserClient();
+    if (!supabase) {
+      setLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+
+    async function load() {
+      const { data, error: fetchError } = await supabase
+        .from('sessions')
+        .select('id, agent_id, status, created_at, updated_at')
+        .order('created_at', { ascending: false })
+        .limit(50);
+
+      if (cancelled) return;
+
+      if (fetchError) {
+        setError(fetchError.message);
+      } else {
+        setSessions((data ?? []) as SessionRow[]);
+      }
+      setLoading(false);
+    }
+
+    load();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [configured]);
+
+  if (!configured) {
+    return <SetupNotice />;
+  }
+
+  if (loading) {
+    return <p className="text-sm text-muted-foreground">Loading sessions…</p>;
+  }
+
+  if (error) {
+    return <p className="text-sm text-red-500">Failed to load sessions: {error}</p>;
+  }
+
+  if (sessions.length === 0) {
+    return <p className="text-sm text-muted-foreground">No sessions recorded yet.</p>;
+  }
 
   return (
-    <div className="rounded-2xl border border-[var(--border-default)] bg-[var(--bg-surface)]">
-      <div className="px-5 py-4 border-b border-[var(--border-default)]">
-        <h2 className="text-sm font-semibold text-[var(--text-primary)]">Sessions</h2>
-      </div>
-      {refreshFailed && (
-        <p className="px-5 py-2 text-xs text-[var(--status-error)] border-b border-[var(--border-default)]">
-          {"Couldn't refresh sessions. Showing the last loaded data."}
-        </p>
-      )}
-      <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
-        <table className="w-full min-w-[720px] text-sm">
-          <thead>
-            <tr className="border-b border-[var(--border-default)] bg-[var(--bg-subtle)]">
-              <th className="px-4 py-3 text-left text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">
-                Channel
-              </th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">
-                Payer
-              </th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">
-                Mode
-              </th>
-              <th className="px-4 py-3 text-right text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">
-                Vouchers
-              </th>
-              <th className="px-4 py-3 text-right text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">
-                Cumulative USDC
-              </th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">
-                Status
-              </th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">
-                Settlement Tx
-              </th>
-              <th className="px-4 py-3 text-right text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">
-                Opened
-              </th>
+    <div className="overflow-x-auto">
+      <table className="w-full text-left text-sm">
+        <thead>
+          <tr className="border-b border-border text-muted-foreground">
+            <th className="py-2 pr-4 font-medium">Session</th>
+            <th className="py-2 pr-4 font-medium">Agent</th>
+            <th className="py-2 pr-4 font-medium">Status</th>
+            <th className="py-2 font-medium">Created</th>
+          </tr>
+        </thead>
+        <tbody>
+          {sessions.map((session) => (
+            <tr key={session.id} className="border-b border-border/50">
+              <td className="py-2 pr-4 font-mono text-xs">{session.id.slice(0, 8)}</td>
+              <td className="py-2 pr-4 font-mono text-xs">
+                {session.agent_id ? session.agent_id.slice(0, 8) : '—'}
+              </td>
+              <td className="py-2 pr-4">{session.status}</td>
+              <td className="py-2 text-muted-foreground">
+                {new Date(session.created_at).toLocaleString()}
+              </td>
             </tr>
           </thead>
           <tbody className="divide-y divide-[var(--border-default)]">
@@ -159,6 +204,22 @@ export function SessionTable({ initialSessions = [] }: SessionTableProps) {
           </tbody>
         </table>
       </div>
+      {sessions.length > 0 && (
+        <div className="flex items-center justify-center border-t border-[var(--border-default)] px-5 py-3">
+          {hasMore ? (
+            <button
+              type="button"
+              onClick={() => void loadMore()}
+              disabled={loadingMore}
+              className="rounded-lg border border-[var(--border-default)] px-4 py-1.5 text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-subtle)] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {loadingMore ? 'Loading…' : 'Load More'}
+            </button>
+          ) : (
+            <span className="text-xs text-[var(--text-muted)]">End of list</span>
+          )}
+        </div>
+      )}
     </div>
-  )
+  );
 }

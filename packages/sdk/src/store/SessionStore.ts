@@ -4,6 +4,7 @@ import {
   KikisAppVoucherMonotonicityError,
   KikisAppNetworkError,
 } from '../errors.js'
+import { usdcToStroops } from '../internal/usdc.js'
 
 // ── Interface ──────────────────────────────────────────────────────────────────
 
@@ -53,20 +54,14 @@ export class SupabaseSessionStore implements SessionStore {
   }
 
   async upsert(channelId: string, state: SessionState): Promise<void> {
-    const existing = await this.get(channelId)
-    if (existing) {
-      const prev = parseFloat(existing.cumulative_amount)
-      const next = parseFloat(state.cumulative_amount)
-      if (next <= prev) {
-        throw new KikisAppVoucherMonotonicityError(
-          `cumulative_amount must be strictly increasing: ${next} <= ${prev}`,
-        )
-      }
-    }
+    const nextStroops = usdcToStroops(state.cumulative_amount)
+    const now = new Date().toISOString()
 
-    const { error } = await this.supabase.from('sessions').upsert(
-      {
-        channel_id: state.channel_id,
+    // Atomic conditional UPDATE: only advance if the row exists AND
+    // the stored cumulative_amount is strictly less than the new amount.
+    const { data, error: updateError } = await this.supabase
+      .from('sessions')
+      .update({
         payee: state.payee,
         payer: state.payer,
         channel_contract: state.channel_contract,
@@ -75,19 +70,78 @@ export class SupabaseSessionStore implements SessionStore {
         last_signature: state.last_signature,
         status: state.status,
         opened_at: state.opened_at,
-        updated_at: new Date().toISOString(),
+        updated_at: now,
         settlement_tx_hash: state.settlement_tx_hash,
-      },
-      { onConflict: 'channel_id' },
-    )
+      })
+      .eq('channel_id', channelId)
+      .lt('cumulative_amount', state.cumulative_amount)
+      .select('channel_id')
 
-    if (error) {
-      if (error.message.includes('strictly increasing')) {
+    if (updateError) {
+      if (updateError.message.includes('strictly increasing')) {
         throw new KikisAppVoucherMonotonicityError(
-          `cumulative_amount must be strictly increasing (DB): ${error.message}`,
+          `cumulative_amount must be strictly increasing (DB): ${updateError.message}`,
         )
       }
-      throw new KikisAppNetworkError(`SessionStore.upsert failed: ${error.message}`)
+      throw new KikisAppNetworkError(`SessionStore.upsert failed: ${updateError.message}`)
+    }
+
+    if (data && data.length > 0) {
+      // Row existed and was successfully advanced
+      return
+    }
+
+    // Zero rows were updated. Either the session already exists (and the new
+    // amount was not strictly greater), or this is the first voucher and the row
+    // has not been created yet.
+    const existing = await this.get(channelId)
+    if (existing) {
+      const prevStroops = usdcToStroops(existing.cumulative_amount)
+      if (nextStroops <= prevStroops) {
+        throw new KikisAppVoucherMonotonicityError(
+          `cumulative_amount must be strictly increasing: ${nextStroops} <= ${prevStroops}`,
+        )
+      }
+    }
+
+    // Row does not exist; attempt initial INSERT.
+    const { error: insertError } = await this.supabase.from('sessions').insert({
+      channel_id: state.channel_id,
+      payee: state.payee,
+      payer: state.payer,
+      channel_contract: state.channel_contract,
+      network: state.network,
+      cumulative_amount: state.cumulative_amount,
+      last_signature: state.last_signature,
+      status: state.status,
+      opened_at: state.opened_at,
+      updated_at: now,
+      settlement_tx_hash: state.settlement_tx_hash,
+    })
+
+    if (insertError) {
+      // If a concurrent insert beat us, re-check monotonicity against the stored row.
+      if (
+        insertError.code === '23505' ||
+        insertError.message.includes('duplicate key') ||
+        insertError.message.includes('unique')
+      ) {
+        const current = await this.get(channelId)
+        if (current) {
+          const prevStroops = usdcToStroops(current.cumulative_amount)
+          if (nextStroops <= prevStroops) {
+            throw new KikisAppVoucherMonotonicityError(
+              `cumulative_amount must be strictly increasing: ${nextStroops} <= ${prevStroops}`,
+            )
+          }
+        }
+      }
+      if (insertError.message.includes('strictly increasing')) {
+        throw new KikisAppVoucherMonotonicityError(
+          `cumulative_amount must be strictly increasing (DB): ${insertError.message}`,
+        )
+      }
+      throw new KikisAppNetworkError(`SessionStore.upsert failed: ${insertError.message}`)
     }
   }
 

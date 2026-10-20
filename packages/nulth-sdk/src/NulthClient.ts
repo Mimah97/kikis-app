@@ -16,6 +16,36 @@ import type {
 } from './types.js'
 import { NulthPolicyError, NulthConfigError } from './types.js'
 
+/**
+ * Canonical binary preimage serializer.
+ *
+ * Encodes each field as a 32-bit big-endian length prefix followed by its
+ * UTF-8 bytes (TLV-style). This removes any delimiter ambiguity: field
+ * boundaries are determined solely by explicit lengths, so inputs containing
+ * pipe characters (or any other byte) cannot shift the preimage boundary
+ * parsing and spoof a different proof context.
+ */
+function encodePreimageField(field: string): Uint8Array {
+  const bytes = new TextEncoder().encode(field)
+  const out = new Uint8Array(4 + bytes.length)
+  const view = new DataView(out.buffer)
+  view.setUint32(0, bytes.length, false)
+  out.set(bytes, 4)
+  return out
+}
+
+function serializePreimage(fields: readonly string[]): Uint8Array {
+  const encoded = fields.map(encodePreimageField)
+  const total = encoded.reduce((sum, part) => sum + part.length, 0)
+  const buffer = new Uint8Array(total)
+  let offset = 0
+  for (const part of encoded) {
+    buffer.set(part, offset)
+    offset += part.length
+  }
+  return buffer
+}
+
 export class NulthClient {
   private policy: NulthPolicyState
   private readonly prover: ProverBackend
@@ -84,7 +114,8 @@ export class NulthClient {
     const payeeHash = hashPayee(context.payee)
     const assetId = context.asset ?? ''
 
-    const preimage = [
+    // Canonical binary preimage: length-prefixed fields, no delimiters.
+    const preimage = serializePreimage([
       authDigest,
       this.policy.allowlistCommitment,
       capCommitment,
@@ -92,8 +123,7 @@ export class NulthClient {
       context.amountStroops.toString(),
       bucket.toString(),
       this.config.nulthAccount,
-      assetId,
-    ].join('|')
+    ])
 
     const proof: NulthProof = {
       version: 1,
@@ -115,6 +145,24 @@ export class NulthClient {
       this.policy.assetSpendStroops = assetSpend
     }
     return proof
+  }
+
+  /**
+   * Roll back a previously reserved off-chain daily spend when the
+   * corresponding transaction submission fails, restoring the available
+   * daily allowance. Throws if the rollback would underflow the accumulator.
+   */
+  rollbackPayment(amountStroops: bigint): void {
+    if (amountStroops < 0n) {
+      throw new RangeError(`Invalid amountStroops: ${amountStroops}`)
+    }
+    if (this.policy.dailySpendStroops < amountStroops) {
+      throw new NulthPolicyError(
+        'rollback_underflow',
+        `Cannot roll back ${amountStroops} stroops; current daily spend is ${this.policy.dailySpendStroops}`,
+      )
+    }
+    this.policy.dailySpendStroops -= amountStroops
   }
 
   /** Encode proof for SorobanAddressCredentials.signature */

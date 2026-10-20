@@ -21,7 +21,8 @@ const payerKeypair = Keypair.random()
 const ASSET_CONTRACT = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA'
 const CHANNEL_CONTRACT = 'CCK4XOW3YKQUEZFONUTINKMSNW7SNMRQZURME5U3UP7E6WNGK7UHUCAH'
 
-let closeCalls: Array<{ amount: bigint; signature: Buffer }> = []
+let closeCalls: Array<{ amount: bigint; signature: Buffer; channel?: string }> = []
+const commitsByChannel = new Map<string, Commit>()
 
 mock.module('@stellar/mpp/channel/server', {
   namedExports: {
@@ -36,11 +37,24 @@ mock.module('@stellar/mpp/channel/server', {
         }
       },
     },
-    close: async (opts: { amount: bigint; signature: Buffer }) => {
-      closeCalls.push({ amount: opts.amount, signature: opts.signature })
+    close: async (opts: { amount: bigint; signature: Buffer; channel: string }) => {
+      closeCalls.push({ amount: opts.amount, signature: opts.signature, channel: opts.channel })
       return 'mock-close-tx-hash'
     },
-    stellar: { channel: () => [] },
+    stellar: {
+      channel: (opts?: { channel?: string }) => {
+        const method = {
+          name: 'stellar',
+          intent: 'channel',
+          channel: opts?.channel,
+          schema: {
+            request: { parse: (x: unknown) => x },
+          },
+          verify: async () => ({ status: 'success' }),
+        }
+        return Object.assign([method], method)
+      },
+    },
   },
 })
 
@@ -54,6 +68,10 @@ mock.module('../mppCompatibility.js', {
     formatMppError: actualCompat.formatMppError,
     onVerifiedCredential: (method: unknown, commit: Commit) => {
       lastCommit = commit
+      const chan = (method as { channel?: string })?.channel
+      if (chan) {
+        commitsByChannel.set(chan, commit)
+      }
       return method
     },
   },
@@ -217,4 +235,94 @@ describe('kikisApp (Express) — voucher state only from verified credentials', 
       await close()
     }
   })
+
+  it('scopes voucher state per-channel to prevent multi-tenant session cross-talk (#58)', async () => {
+    const CHAN_A = 'C_TEST_CHAN_AAA_111'
+    const CHAN_B = 'C_TEST_CHAN_BBB_222'
+
+    const vouchersA: Array<{ count: number; amount: string }> = []
+    const vouchersB: Array<{ count: number; amount: string }> = []
+
+    const { url, close } = await makeServer({
+      onVoucher: async (channelId, voucherIndex, cumulativeAmount) => {
+        if (channelId === CHAN_A) vouchersA.push({ count: voucherIndex, amount: cumulativeAmount })
+        if (channelId === CHAN_B) vouchersB.push({ count: voucherIndex, amount: cumulativeAmount })
+      },
+    })
+
+    try {
+      // Warm up / instantiate handlers for Channel A and Channel B
+      await fetch(`${url}/price`, { headers: { 'x-channel-id': CHAN_A } })
+      await fetch(`${url}/price`, { headers: { 'x-channel-id': CHAN_B } })
+
+      const commitA = commitsByChannel.get(CHAN_A)
+      const commitB = commitsByChannel.get(CHAN_B)
+
+      assert.ok(commitA, 'Channel A should have captured commit')
+      assert.ok(commitB, 'Channel B should have captured commit')
+
+      // Emit vouchers on Channel A
+      await commitA({ payload: { amount: '1000', signature: 'aa'.repeat(32) } })
+      await commitA({ payload: { amount: '2000', signature: 'ab'.repeat(32) } })
+      await commitA({ payload: { amount: '3000', signature: 'ac'.repeat(32) } })
+
+      // Emit vouchers on Channel B
+      await commitB({ payload: { amount: '500', signature: 'b1'.repeat(32) } })
+      await commitB({ payload: { amount: '1500', signature: 'b2'.repeat(32) } })
+
+      // Verify independent voucher counts and amounts
+      assert.equal(vouchersA.length, 3)
+      assert.equal(vouchersA[vouchersA.length - 1]!.amount, '0.0003000')
+      assert.equal(vouchersA[vouchersA.length - 1]!.count, 3)
+
+      assert.equal(vouchersB.length, 2)
+      assert.equal(vouchersB[vouchersB.length - 1]!.amount, '0.0001500')
+      assert.equal(vouchersB[vouchersB.length - 1]!.count, 2)
+
+      // Close Session A
+      const resA = await fetch(`${url}/price`, {
+        method: 'DELETE',
+        headers: {
+          'content-type': 'application/json',
+          'x-channel-id': CHAN_A,
+        },
+      })
+      assert.equal(resA.status, 200)
+
+      // Verify Session A closed with amount 3000n and signature 'ac'
+      const closeA = closeCalls.find((c) => c.channel === CHAN_A)
+      assert.ok(closeA)
+      assert.equal(closeA.amount, 3000n)
+      assert.deepEqual(closeA.signature, Buffer.from('ac'.repeat(32), 'hex'))
+
+      // Verify Session B was completely unaffected by Session A's close
+      const resB = await fetch(`${url}/price`, {
+        method: 'DELETE',
+        headers: {
+          'content-type': 'application/json',
+          'x-channel-id': CHAN_B,
+        },
+      })
+      assert.equal(resB.status, 200)
+
+      const closeB = closeCalls.find((c) => c.channel === CHAN_B)
+      assert.ok(closeB)
+      assert.equal(closeB.amount, 1500n)
+      assert.deepEqual(closeB.signature, Buffer.from('b2'.repeat(32), 'hex'))
+
+      // Memory leak check: subsequent DELETE on already closed Channel A returns no vouchers
+      const resAAfter = await fetch(`${url}/price`, {
+        method: 'DELETE',
+        headers: {
+          'content-type': 'application/json',
+          'x-channel-id': CHAN_A,
+        },
+      })
+      const bodyAAfter = (await resAAfter.json()) as { closeTxHash: string | null }
+      assert.equal(bodyAAfter.closeTxHash, null)
+    } finally {
+      await close()
+    }
+  })
 })
+

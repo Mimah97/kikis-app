@@ -32,6 +32,7 @@ export function useSession(url: string): UseSessionResult {
   const mountedRef = useRef(true)
   const sessionRef = useRef<SessionHandle | null>(null)
   const unsubscribeRef = useRef<(() => void) | null>(null)
+  const unsubscribeLifecycleRef = useRef<(() => void) | null>(null)
 
   useEffect(() => {
     mountedRef.current = true
@@ -41,6 +42,10 @@ export function useSession(url: string): UseSessionResult {
       // an unmounted component (#15).
       unsubscribeRef.current?.()
       unsubscribeRef.current = null
+      // Detach lifecycle listeners so a background timeout/close-failure can't
+      // update state after unmount (#87).
+      unsubscribeLifecycleRef.current?.()
+      unsubscribeLifecycleRef.current = null
       const s = sessionRef.current
       if (s) {
         s.close().catch(() => {
@@ -67,6 +72,39 @@ export function useSession(url: string): UseSessionResult {
         setVouchers(payload.vouchersIssued)
         setCumulative(payload.currentCumulative)
       })
+      // Subscribe to lifecycle events so a background wall-clock timeout or a
+      // failed auto-close is reflected in React state instead of leaving the
+      // UI stuck on status === 'open' (#87).
+      unsubscribeLifecycleRef.current?.()
+      const offTimeout = s.on('session:timeout', () => {
+        if (!mountedRef.current) return
+        sessionRef.current = null
+        unsubscribeRef.current?.()
+        unsubscribeRef.current = null
+        setSession(null)
+        setStatus('closed')
+      })
+      const offCloseFailed = s.on('session:close-failed', (payload) => {
+        if (!mountedRef.current) return
+        sessionRef.current = null
+        unsubscribeRef.current?.()
+        unsubscribeRef.current = null
+        const e =
+          payload instanceof Error
+            ? payload
+            : new Error(
+                typeof payload === 'object' && payload !== null && 'error' in payload
+                  ? String((payload as { error: unknown }).error)
+                  : 'Session auto-close failed',
+              )
+        setSession(null)
+        setError(e)
+        setStatus('error')
+      })
+      unsubscribeLifecycleRef.current = () => {
+        offTimeout()
+        offCloseFailed()
+      }
       if (mountedRef.current) {
         setSession(s)
         setStatus('open')
@@ -93,6 +131,8 @@ export function useSession(url: string): UseSessionResult {
       // authoritative final totals below, so no further update can arrive.
       unsubscribeRef.current?.()
       unsubscribeRef.current = null
+      unsubscribeLifecycleRef.current?.()
+      unsubscribeLifecycleRef.current = null
       if (mountedRef.current) {
         setSession(null)
         setStatus('closed')

@@ -79,6 +79,25 @@ export interface NulthClientConfig {
   logger?: any
 }
 
+/**
+ * Configuration for a Nulth signer.
+ *
+ * NOTE: `paymentContext` is deprecated. Mutating a shared config's
+ * `paymentContext` before each signing call is racy under concurrency —
+ * Payment B can overwrite the context while Payment A is awaiting proof
+ * generation. Prefer `createScopedPaymentSigner(config, paymentContext)`,
+ * which binds the context immutably in closure scope per payment.
+ *
+ * @deprecated Use `createScopedPaymentSigner` instead of setting this field.
+ */
+export interface NulthSignerConfig extends NulthClientConfig {
+  /**
+   * @deprecated Shared mutable payment context — racy under concurrency.
+   * Use `createScopedPaymentSigner(config, paymentContext)` instead.
+   */
+  paymentContext?: PaymentAuthContext
+}
+
 export class NulthPolicyError extends Error {
   readonly code: 'payee_not_allowed' | 'daily_cap_exceeded' | 'asset_cap_exceeded' | 'session_expired' | 'auth_entry_mismatch'
 

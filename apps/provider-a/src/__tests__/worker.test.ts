@@ -67,6 +67,30 @@ describe('provider-a worker payment path & routes', () => {
     )
   })
 
+  it('OPTIONS /price preflight responds with 204 and CORS allow headers', async () => {
+    const req = new Request('http://localhost/price', {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://agent.example.com',
+        'Access-Control-Request-Method': 'GET',
+        'Access-Control-Request-Headers': 'Payment-Signature, X-Payment',
+      },
+    })
+    const res = await worker.fetch(req, mockEnv, mockCtx)
+
+    assert.equal(res.status, 204)
+    assert.equal(res.headers.get('Access-Control-Allow-Origin'), '*')
+
+    const allowHeaders = (res.headers.get('Access-Control-Allow-Headers') ?? '').toLowerCase()
+    assert.ok(allowHeaders.includes('payment-signature'), 'must allow Payment-Signature header')
+    assert.ok(allowHeaders.includes('x-payment'), 'must allow X-Payment header')
+
+    const exposeHeaders = (res.headers.get('Access-Control-Expose-Headers') ?? '').toLowerCase()
+    assert.ok(exposeHeaders.includes('x-payment-requirements'), 'must expose X-Payment-Requirements header')
+    assert.ok(exposeHeaders.includes('x-payment-response'), 'must expose X-Payment-Response header')
+    assert.ok(exposeHeaders.includes('payment-receipt'), 'must expose Payment-Receipt header')
+  })
+
   it('GET /health returns 503 misconfigured when STELLAR_PAYEE_SECRET is unset', async () => {
     const badEnv = { ...mockEnv, STELLAR_PAYEE_SECRET: undefined } as unknown as Env
     const req = new Request('http://localhost/health')

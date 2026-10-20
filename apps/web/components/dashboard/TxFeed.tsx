@@ -1,15 +1,17 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { getSupabaseBrowserClient, type TxLogEntry } from '@/lib/supabase'
+import { getSupabaseBrowserClient, isSupabaseConfigured, type TxLogEntry } from '@/lib/supabase'
 import { mergeTxEntries } from '@/lib/mergeTxEntries'
 import { ModeBadge } from '@/components/shared/ModeBadge'
 import { RelativeTime } from '@/components/shared/RelativeTime'
 import { TxHashLink } from '@/components/shared/TxHashLink'
 
 const MAX_ENTRIES = 20
+const PAGE_SIZE = 20
 const FALLBACK_POLL_MS = 10_000
+const CONNECTED_POLL_MS = 60_000
 
 const TX_TYPE_LABEL: Record<TxLogEntry['tx_type'], string> = {
   x402_settle: 'settled',
@@ -30,9 +32,20 @@ interface TxFeedProps {
 export function TxFeed({ initialEntries = [] }: TxFeedProps) {
   const [entries, setEntries] = useState<TxLogEntry[]>(initialEntries)
   const [paused, setPaused] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [hasMore, setHasMore] = useState(initialEntries.length >= PAGE_SIZE)
+  const cursorRef = useRef<string | null>(
+    initialEntries.length > 0
+      ? initialEntries[initialEntries.length - 1].created_at
+      : null,
+  )
 
   useEffect(() => {
+    if (!configured) return
+
     const supabase = getSupabaseBrowserClient()
+    if (!supabase) return
+
     let disposed = false
     let pollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -65,10 +78,11 @@ export function TxFeed({ initialEntries = [] }: TxFeedProps) {
       setEntries((prev) => mergeTxEntries(prev, rows, MAX_ENTRIES))
     }
 
-    // Only one fallback interval at a time.
-    function startPolling() {
+    // Only one fallback interval at a time. When the realtime socket is live we
+    // still poll, but at a much lower frequency to reconcile any dropped events.
+    function startPolling(intervalMs: number) {
       if (pollTimer !== null) return
-      pollTimer = setInterval(() => void refresh(), FALLBACK_POLL_MS)
+      pollTimer = setInterval(() => void refresh(), intervalMs)
     }
 
     const channel = supabase
@@ -92,13 +106,16 @@ export function TxFeed({ initialEntries = [] }: TxFeedProps) {
           // snapshot and the channel going live, plus anything missed while the
           // socket was down.
           void refresh()
+          // Reduced-frequency safety net while the WebSocket is connected.
+          startPolling(CONNECTED_POLL_MS)
           return
         }
 
         if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
           console.warn('[tx-feed] realtime channel', status, err?.message ?? '')
           setPaused(true)
-          startPolling()
+          stopPolling()
+          startPolling(FALLBACK_POLL_MS)
         }
       })
 
@@ -109,7 +126,41 @@ export function TxFeed({ initialEntries = [] }: TxFeedProps) {
       stopPolling()
       void supabase.removeChannel(channel)
     }
-  }, [])
+  }, [configured])
+
+  // Cursor-based pagination: fetch the next batch strictly older than the
+  // oldest row currently shown, using the indexed created_at column.
+  async function loadMore() {
+    const cursor = cursorRef.current
+    if (loadingMore || !hasMore || cursor === null) return
+
+    setLoadingMore(true)
+    const supabase = getSupabaseBrowserClient()
+    const { data, error } = await supabase
+      .from('tx_log')
+      .select('*')
+      .lt('created_at', cursor)
+      .order('created_at', { ascending: false })
+      .limit(PAGE_SIZE)
+
+    if (error) {
+      console.warn('[tx-feed] failed to load more tx_log:', error.message)
+      setLoadingMore(false)
+      return
+    }
+
+    const rows = (data ?? []) as TxLogEntry[]
+    if (rows.length > 0) {
+      cursorRef.current = rows[rows.length - 1].created_at
+    }
+    setHasMore(rows.length === PAGE_SIZE)
+    setEntries((prev) => {
+      const seen = new Set(prev.map((e) => e.id))
+      const appended = rows.filter((r) => !seen.has(r.id))
+      return appended.length > 0 ? [...prev, ...appended] : prev
+    })
+    setLoadingMore(false)
+  }
 
   return (
     <div className="rounded-2xl border border-[var(--border-default)] bg-[var(--bg-surface)] flex flex-col max-h-[420px]">
@@ -121,7 +172,17 @@ export function TxFeed({ initialEntries = [] }: TxFeedProps) {
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        {entries.length === 0 ? (
+        {!configured ? (
+          <div className="px-5 py-8 text-center">
+            <p className="text-sm font-medium text-[var(--text-primary)]">Supabase not configured</p>
+            <p className="mt-1 text-xs text-[var(--text-muted)]">
+              Copy <code className="font-mono">.env.example</code> to{' '}
+              <code className="font-mono">.env.local</code> and set{' '}
+              <code className="font-mono">NEXT_PUBLIC_SUPABASE_URL</code> and{' '}
+              <code className="font-mono">NEXT_PUBLIC_SUPABASE_ANON_KEY</code> to see live transactions.
+            </p>
+          </div>
+        ) : entries.length === 0 ? (
           <div className="px-5 py-8 text-center">
             <span className="inline-flex items-center gap-2 text-sm text-[var(--text-muted)]">
               <span className="h-1.5 w-1.5 rounded-full bg-[var(--text-muted)] animate-pulse" />
@@ -174,6 +235,21 @@ export function TxFeed({ initialEntries = [] }: TxFeedProps) {
               ))}
             </AnimatePresence>
           </ul>
+        )}
+      </div>
+
+      <div className="px-5 py-3 border-t border-[var(--border-default)] shrink-0 text-center">
+        {hasMore ? (
+          <button
+            type="button"
+            onClick={() => void loadMore()}
+            disabled={loadingMore}
+            className="text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {loadingMore ? 'Loading…' : 'Load More'}
+          </button>
+        ) : (
+          <span className="text-xs text-[var(--text-muted)]">End of feed</span>
         )}
       </div>
     </div>

@@ -37,3 +37,71 @@ export function hexToBytes(hex: string): Uint8Array {
   }
   return bytes
 }
+
+/**
+ * Tolerated clock drift (in milliseconds) when validating authorization
+ * expiration. A payload is considered expired only once the current time
+ * exceeds its deadline by more than this skew, so minor clock differences
+ * between client and provider do not reject otherwise-fresh signatures.
+ */
+export const CLOCK_SKEW_MS = 60_000
+
+/**
+ * Resolve the absolute expiration deadline (epoch milliseconds) of a decoded
+ * x402 authorization payload.
+ *
+ * Accepts an explicit `expiresAt` (epoch seconds or milliseconds) and/or a
+ * relative `maxTimeoutSeconds` window. When only a relative window is present
+ * it is anchored to `issuedAt`/`validAfter` if available, otherwise to the
+ * current clock. Returns `undefined` when the payload carries no temporal
+ * bounds, so callers can decide whether to reject or allow it.
+ */
+export function resolveAuthorizationExpiry(
+  payload: Record<string, unknown>,
+  now: number = Date.now(),
+): number | undefined {
+  const toMillis = (value: unknown): number | undefined => {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      // Values below this threshold are treated as epoch seconds.
+      return value < 1e12 ? value * 1000 : value
+    }
+    if (typeof value === 'string' && value.trim() !== '') {
+      const parsed = Number(value)
+      if (Number.isFinite(parsed)) {
+        return parsed < 1e12 ? parsed * 1000 : parsed
+      }
+      const asDate = Date.parse(value)
+      if (!Number.isNaN(asDate)) return asDate
+    }
+    return undefined
+  }
+
+  const explicit = toMillis(payload.expiresAt)
+  if (explicit !== undefined) return explicit
+
+  const timeoutSeconds = toMillis(payload.maxTimeoutSeconds)
+  if (timeoutSeconds !== undefined) {
+    const anchor =
+      toMillis(payload.issuedAt) ??
+      toMillis(payload.validAfter) ??
+      now
+    return anchor + timeoutSeconds
+  }
+
+  return undefined
+}
+
+/**
+ * Returns `true` when the authorization payload's deadline has lapsed beyond
+ * the tolerated clock skew. Payloads without any temporal bounds are treated
+ * as non-expiring (returns `false`) to preserve backward compatibility.
+ */
+export function isAuthorizationExpired(
+  payload: Record<string, unknown>,
+  now: number = Date.now(),
+  skewMs: number = CLOCK_SKEW_MS,
+): boolean {
+  const expiresAt = resolveAuthorizationExpiry(payload, now)
+  if (expiresAt === undefined) return false
+  return now > expiresAt + skewMs
+}

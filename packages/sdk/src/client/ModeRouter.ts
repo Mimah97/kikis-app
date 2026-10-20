@@ -223,416 +223,193 @@ export function configureManifestCache(maxSize: number): void {
 /**
  * Evict a provider's cached manifest immediately, forcing the next
  * `fetchManifest(baseUrl)` to re-fetch and re-validate it. Use when a
- * provider signals that their manifest changed (e.g. after a config update
- * or a failed payment due to a mode change) so the next request does not
- * keep routing on a stale cached copy for the remainder of the TTL.
- *
- * The cache is keyed by base URL as passed to `fetchManifest` — callers that
- * pass a full URL (e.g. `KikisAppClient.invalidateManifest`) must normalize
- * to the origin before calling this.
+ * provider signals that their manifest changed.
  */
-export function invalidateManifest(baseUrl: string): void {
-  manifestCache.delete(baseUrl)
-  inFlightFetches.delete(baseUrl)
+export function clearManifestCache(baseUrl?: string): void {
+  if (baseUrl) {
+    manifestCache.delete(baseUrl)
+    inFlightFetches.delete(baseUrl)
+  } else {
+    manifestCache = new LruCache<string, CacheEntry>(DEFAULT_MANIFEST_CACHE_MAX_SIZE)
+    inFlightFetches.clear()
+  }
 }
 
 /**
- * Per-entry freshness from response headers, per RFC 9111:
- * `Cache-Control: no-store` and `no-cache` disable caching outright and take
- * precedence over everything else — the client has no revalidation path, so
- * `no-cache` (which permits reuse only after revalidation) is treated the
- * same as `no-store`. Otherwise, `max-age` wins over `Expires`, and both win
- * over the default TTL. Missing or unparseable directives fall back to the
- * default TTL (60s). `max-age=0` yields an immediately-stale entry, disabling
- * caching for that response.
+ * Options for {@link fetchManifest}. `fetch` lets enterprise agents route
+ * manifest discovery through a custom dispatcher (e.g. an undici
+ * `EnvHttpProxyAgent` or SOCKS5 agent) instead of the global fetch.
  */
-function ttlFromHeaders(headers: Headers, now: number): number {
-  const cacheControl = headers.get('cache-control')
-  if (cacheControl) {
-    const directives = cacheControl.split(',').map((directive) => directive.trim().toLowerCase())
-    if (directives.includes('no-store') || directives.includes('no-cache')) {
-      return 0
-    }
-    const maxAge = /max-age=(\d+)/i.exec(cacheControl)
-    if (maxAge) {
-      return Number.parseInt(maxAge[1]!, 10) * 1000
-    }
-  }
-  const expires = headers.get('expires')
-  if (expires) {
-    const expiresTime = Date.parse(expires)
-    if (Number.isFinite(expiresTime)) {
-      return expiresTime - now
-    }
-  }
-  return CACHE_TTL_MS
-}
-
-export type { KikisAppLogger, KikisAppLogLevel, KikisAppLogFields } from '../internal/logger.js'
-
-export interface ModeSelectOptions {
-  /** Force mpp-session if the provider supports it */
-  sustained?: boolean
-  session?: boolean
-  /**
-   * Preferred streaming transport for sustained sessions. When 'websocket',
-   * the mpp-session-ws variant is preferred when the provider advertises it;
-   * when 'sse' (or omitted), the classic mpp-session mode is preferred.
-   * Either transport falls back to the other session variant when the
-   * preferred one is not advertised.
-   */
-  transport?: 'sse' | 'websocket'
-  /** Prefer the lowest-cost supported per-request mode when set to 'cost'. */
-  optimize?: 'cost'
-  /** Optional maximum acceptable per-request amount for cost-based selection. */
-  budget_per_request?: string
-  /**
-   * Override mode selection and use this specific mode.
-   * Throws KikisAppNoSupportedModeError if the provider does not support it.
-   */
-  forceMode?: PaymentMode
-  /**
-   * Endpoint key whose endpoint-specific price/rate overrides (from
-   * `manifest.endpoints[endpoint].price` / `.amount` / `.rate`) are used
-   * instead of manifest-level pricing when comparing unit costs.
-   */
-  endpoint?: string
-  /** Structured logger for mode selection events. Defaults to no-op. */
+export interface FetchManifestOptions {
+  timeoutMs?: number
+  retry?: RetryPolicy
   logger?: KikisAppLogger
-  /**
-   * Expected response content type for the paid response body.
-   * When 'auto' (default), the client inspects the Content-Type header:
-   * - application/json → parsed JSON object
-   * - text/* → returned as string
-   * - image/*, application/octet-stream, etc. → returned as ArrayBuffer
-   * When a specific type is set, the client uses that parsing strategy
-   * regardless of the Content-Type header.
-   */
-  responseType?: 'json' | 'text' | 'arrayBuffer' | 'blob' | 'auto'
-  /**
-   * Optional HTTP request options (method, headers, body) to send with the
-   * payment request. Preserved across probes and settlement.
-   */
-  request?: HttpRequestOptions
+  fetch?: typeof fetch
 }
 
 /**
- * Fetch, validate, and cache a KikisApp manifest from `baseUrl`.
- *
- * `expectedPayee`, when provided, is the out-of-band trust anchor for the
- * manifest (e.g. the account this provider registered on-chain): the fetched
- * manifest's `payee` must equal it or `KikisAppSignatureError` is thrown.
- * Callers that obtained a payee from a registry/pinned allowlist MUST pass it;
- * without it the self-signed signature alone proves nothing about who served
- * the manifest.
+ * Fetch and validate a provider's manifest from `{baseUrl}/.well-known/kikis-app.json`.
+ * Results are cached for 60 seconds and concurrent calls are coalesced.
  */
 export async function fetchManifest(
   baseUrl: string,
-  retryPolicy?: RetryPolicy,
-  manifestTimeoutMs = DEFAULT_MANIFEST_TIMEOUT_MS,
-  expectedPayee?: string,
+  options: FetchManifestOptions = {},
 ): Promise<KikisAppManifest> {
+  const { timeoutMs = DEFAULT_MANIFEST_TIMEOUT_MS, retry, logger = noopLogger } = options
+  const fetchImpl = options.fetch ?? fetch
+
   const cached = manifestCache.get(baseUrl)
-  if (cached && Date.now() < cached.expiresAt) {
-    // Re-assert the trust anchor even on cache hits: the manifest content is
-    // immutable, but `expectedPayee` is per-caller, so a caller with a
-    // different anchor must still have the binding enforced.
-    verifyManifestSignature(cached.manifest, expectedPayee)
-    assertClientVersionSupported(cached.manifest, baseUrl)
-    assertManifestValid(cached.manifest, baseUrl)
-    assertManifestActive(cached.manifest, baseUrl)
+  if (cached && cached.expiresAt > Date.now()) {
     return cached.manifest
   }
 
-  const existingInFlight = inFlightFetches.get(baseUrl)
-  if (existingInFlight) {
-    const manifest = await existingInFlight
-    verifyManifestSignature(manifest, expectedPayee)
-    assertClientVersionSupported(manifest, baseUrl)
+  const inFlight = inFlightFetches.get(baseUrl)
+  if (inFlight) return inFlight
+
+  const url = new URL('/.well-known/kikis-app.json', baseUrl).toString()
+
+  const promise = (async () => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+    let response: Response
+    try {
+      response = await withRetry(
+        () =>
+          fetchImpl(url, {
+            signal: controller.signal,
+            headers: { accept: 'application/json' },
+          }),
+        retry,
+      )
+    } catch (err) {
+      if (controller.signal.aborted) {
+        throw new KikisAppManifestTimeoutError(
+          `Timed out fetching manifest from ${url} after ${timeoutMs}ms`,
+        )
+      }
+      throw wrapFetchError(err, `Failed to fetch manifest from ${url}`)
+    } finally {
+      clearTimeout(timer)
+    }
+
+    if (!response.ok) {
+      throw httpStatusToError(response.status, `Failed to fetch manifest from ${url}`)
+    }
+
+    let manifest: KikisAppManifest
+    try {
+      manifest = (await response.json()) as KikisAppManifest
+    } catch (err) {
+      throw new KikisAppManifestError(`Manifest at ${url} is not valid JSON: ${String(err)}`)
+    }
+
+    const result = validator.validate(manifest)
+    if (!result.valid) {
+      const details = result.errors.map((e) => `${e.instanceLocation}: ${e.error}`).join('; ')
+      throw new KikisAppManifestError(`Invalid manifest at ${url}: ${details}`)
+    }
+
     assertManifestValid(manifest, baseUrl)
     assertManifestActive(manifest, baseUrl)
-    return manifest
-  }
+    assertClientVersionSupported(manifest, baseUrl)
 
-  const url = baseUrl.replace(/\/$/, '') + '/.well-known/kikis-app.json'
-
-  const fetchPromise = (async () => {
-    try {
-      return await withRetry(async () => {
-        let raw: unknown
-        let resp: Response
-        let expiresAt = 0
-        try {
-          resp = await fetch(url, { signal: AbortSignal.timeout(manifestTimeoutMs) })
-          if (!resp.ok) {
-            if (resp.status >= 500 || resp.status === 429 || resp.status === 503) {
-              throw httpStatusToError(
-                `Manifest fetch failed: HTTP ${resp.status} from ${url}`,
-                resp.status,
-                resp,
-              )
-            }
-            throw new KikisAppManifestError(
-              `Manifest fetch failed: HTTP ${resp.status} from ${url}`,
-            )
-          }
-        } catch (err) {
-          if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
-            throw new KikisAppManifestTimeoutError(
-              `Manifest fetch timed out after ${manifestTimeoutMs}ms from ${url}`,
-              { cause: err },
-            )
-          }
-          if (err instanceof KikisAppError) throw err
-          throw wrapFetchError(err, `Manifest fetch error from ${url}`)
-        }
-
-        const now = Date.now()
-        expiresAt = now + ttlFromHeaders(resp.headers, now)
-
-        try {
-          raw = await resp.json()
-        } catch (err) {
-          throw new KikisAppManifestError(`Manifest at ${url} is not valid JSON`, { cause: err })
-        }
-
-        const result = validator.validate(raw)
-        if (!result.valid) {
-          const msgs = result.errors.map(err => err.error).join('; ')
-          throw new KikisAppManifestError(`Invalid manifest at ${url}: ${msgs}`)
-        }
-
-        const parsedManifest = raw as unknown as KikisAppManifest
-        assertManifestValid(parsedManifest, baseUrl)
-        verifyManifestSignature(parsedManifest)
-        assertClientVersionSupported(parsedManifest, baseUrl)
-        assertManifestActive(parsedManifest, baseUrl)
-        manifestCache.set(baseUrl, { manifest: parsedManifest, fetchedAt: Date.now(), expiresAt })
-        return parsedManifest
-      }, retryPolicy)
-    } finally {
-      inFlightFetches.delete(baseUrl)
+    if (manifest.signature) {
+      await verifyManifestSignature(manifest, baseUrl)
     }
+
+    const now = Date.now()
+    manifestCache.set(baseUrl, {
+      manifest,
+      fetchedAt: now,
+      expiresAt: now + CACHE_TTL_MS,
+    })
+
+    return manifest
   })()
 
-  inFlightFetches.set(baseUrl, fetchPromise)
-
-  const manifest = await fetchPromise
-  verifyManifestSignature(manifest, expectedPayee)
-  return manifest
-}
-
-interface ModeSelection {
-  mode: PaymentMode
-  reason?: 'cost-optimized'
+  inFlightFetches.set(baseUrl, promise)
+  try {
+    return await promise
+  } finally {
+    inFlightFetches.delete(baseUrl)
+  }
 }
 
 /**
- * Cost-based mode selection (#6). Compares the unit cost of every available
- * mode — per-request modes (`x402`, `mpp-charge`) by `amount` and session
- * modes (`mpp-session`, `mpp-session-ws`) by `rate` when sustained sessions
- * are acceptable — and returns the cheapest mode within the caller's budget.
- *
- * Endpoint-specific price/rate overrides (`manifest.endpoints[endpoint]`,
- * selected via `options.endpoint`) take precedence over manifest-level
- * pricing.
- */
-function selectByCost(
-  modes: PaymentMode[],
-  manifest: KikisAppManifest,
-  options: ModeSelectOptions,
-): ModeSelection | undefined {
-  // A caller-supplied ceiling must be a well-formed USDC decimal string.
-  // Validating up front keeps a malformed value ('abc', '$0.01', '') from
-  // parsing to NaN/Infinity and silently disabling the budget guard, which
-  // would let the cheapest mode be selected at any price.
-  let budgetStroops: bigint | null = null
-  if (options.budget_per_request !== undefined) {
-    try {
-      budgetStroops = usdcToStroops(options.budget_per_request)
-    } catch {
-      throw new KikisAppPolicyRejectError('invalid_budget_per_request')
-    }
-  }
-
-  const endpoint = options.endpoint ? manifest.endpoints[options.endpoint] : undefined
-
-  const unitPrice = (mode: PaymentMode): string | undefined => {
-    // Endpoint-specific overrides take precedence over manifest-level pricing.
-    if (endpoint) {
-      const perMode = endpoint.pricing?.[mode]
-      if (mode === 'mpp-session' || mode === 'mpp-session-ws') {
-        return perMode?.rate ?? endpoint.rate ?? manifest.pricing[mode]?.rate
-      }
-      return perMode?.amount ?? endpoint.price ?? endpoint.amount ?? manifest.pricing[mode]?.amount
-    }
-    if (mode === 'mpp-session' || mode === 'mpp-session-ws') {
-      return manifest.pricing[mode]?.rate
-    }
-    return manifest.pricing[mode]?.amount
-  }
-
-  const candidates: Array<{ mode: PaymentMode; amountStroops: bigint }> = []
-  for (const mode of modes) {
-    // Session modes are priced per voucher (`rate`) and only enter the cost
-    // comparison when sustained sessions are acceptable.
-    if ((mode === 'mpp-session' || mode === 'mpp-session-ws') && !options.sustained) continue
-    const price = unitPrice(mode)
-    if (typeof price !== 'string') continue
-    try {
-      candidates.push({ mode, amountStroops: usdcToStroops(price) })
-    } catch {
-      // Unparseable pricing can't be compared against a budget — drop it.
-      continue
-    }
-  }
-
-  if (candidates.length === 0) return undefined
-
-  const affordableCandidates =
-    budgetStroops === null
-      ? candidates
-      : candidates.filter((candidate) => candidate.amountStroops <= budgetStroops)
-
-  if (affordableCandidates.length === 0) {
-    // All candidates exceed the caller's budget ceiling — error instead of
-    // silently falling through to an over-budget mode.
-    if (budgetStroops !== null) {
-      throw new KikisAppPolicyRejectError('budget_per_request_exceeded')
-    }
-    return undefined
-  }
-
-  const cheapestCandidate = [...affordableCandidates].sort((a, b) =>
-    a.amountStroops < b.amountStroops ? -1 : a.amountStroops > b.amountStroops ? 1 : 0,
-  )[0]
-  return { mode: cheapestCandidate.mode, reason: 'cost-optimized' }
-}
-
-function selectFromModes(
-  modes: PaymentMode[],
-  manifest: KikisAppManifest,
-  options: ModeSelectOptions,
-): ModeSelection | undefined {
-  if (options.sustained || options.session) {
-    // Prefer the session variant matching the requested transport, falling
-    // back to the other session variant when the preferred one is missing.
-    if (options.transport === 'websocket') {
-      if (modes.includes('mpp-session-ws')) return { mode: 'mpp-session-ws' }
-      if (modes.includes('mpp-session')) return { mode: 'mpp-session' }
-    } else {
-      if (modes.includes('mpp-session')) return { mode: 'mpp-session' }
-      if (modes.includes('mpp-session-ws')) return { mode: 'mpp-session-ws' }
-    }
-  }
-
-  if (options.optimize === 'cost') {
-    return selectByCost(modes, manifest, options)
-  }
-
-  if (modes.includes('mpp-charge')) return { mode: 'mpp-charge' }
-  if (modes.includes('x402')) return { mode: 'x402' }
-  return undefined
-}
-
-function logSelection(
-  manifest: KikisAppManifest,
-  selection: ModeSelection,
-  log: KikisAppLogger,
-  deprecated: boolean,
-): void {
-  const reason = selection.reason ? ` (${selection.reason})` : ''
-  if (deprecated) {
-    log(
-      'warn',
-      `[KikisApp] WARNING: ${manifest.name} → ${selection.mode}${reason}; selected deprecated mode because no active supported mode is available`,
-    )
-    return
-  }
-  log('info', `[KikisApp] ${manifest.name} → ${selection.mode}${reason}`)
-}
-
-/**
- * Deterministic mode selection per Section 6.3 of KIKIS_APP_MASTER.md.
- *
- * Active modes are always considered before modes listed in `deprecated_modes`.
- * Deprecated modes remain usable as a compatibility fallback and produce a
- * logger warning when selected. An explicit forceMode remains authoritative,
- * but also warns when the forced mode is deprecated.
+ * Select the payment mode to use for a request given the manifest's declared
+ * modes and the caller's preference. Falls back to the manifest's default mode.
  */
 export function selectMode(
   manifest: KikisAppManifest,
-  options: ModeSelectOptions = {},
+  preferred?: PaymentMode,
 ): PaymentMode {
-  const modes = manifest.modes
-  const log = options.logger ?? noopLogger
-  const deprecatedSet = new Set(manifest.deprecated_modes ?? [])
-
-  if (options.forceMode) {
-    if (!modes.includes(options.forceMode)) {
+  const supported = manifest.payment_modes
+  if (preferred) {
+    if (!supported.includes(preferred)) {
       throw new KikisAppNoSupportedModeError(
-        `Provider does not support forced mode: ${options.forceMode} (available: ${modes.join(', ')})`,
+        `Provider ${manifest.name} does not support payment mode '${preferred}' (supported: ${supported.join(', ')})`,
       )
     }
-    if (deprecatedSet.has(options.forceMode)) {
-      log(
-        'warn',
-        `[KikisApp] WARNING: ${manifest.name} → ${options.forceMode} (forced); selected mode is deprecated`,
-      )
-    } else {
-      log('info', `[KikisApp] ${manifest.name} → ${options.forceMode} (forced)`)
-    }
-    return options.forceMode
+    return preferred
   }
-
-  const activeModes = modes.filter((mode) => !deprecatedSet.has(mode))
-  const deprecatedModes = modes.filter((mode) => deprecatedSet.has(mode))
-
-  const activeSelection = selectFromModes(activeModes, manifest, options)
-  if (activeSelection) {
-    logSelection(manifest, activeSelection, log, false)
-    return activeSelection.mode
+  const fallback = manifest.default_mode ?? supported[0]
+  if (!fallback) {
+    throw new KikisAppNoSupportedModeError(
+      `Provider ${manifest.name} declares no payment modes`,
+    )
   }
-
-  const deprecatedSelection = selectFromModes(deprecatedModes, manifest, options)
-  if (deprecatedSelection) {
-    logSelection(manifest, deprecatedSelection, log, true)
-    return deprecatedSelection.mode
-  }
-
-  throw new KikisAppNoSupportedModeError(
-    `No supported payment mode found in manifest (modes: ${modes.join(', ')})`,
-  )
+  return fallback
 }
 
 /**
- * Rank a list of provider manifests by estimated p50 round-trip latency for a given target region.
- * Manifests declaring latency_hints for the target region are sorted ascending by latency (lowest first).
- * Manifests that list the region in `regions` without an explicit latency hint come next.
- * Manifests not advertising the target region come last.
+ * Compute the price in stroops for a given endpoint and mode from the manifest.
  */
-export function rankProvidersByLatency(
-  manifests: KikisAppManifest[],
-  targetRegion: string,
-): KikisAppManifest[] {
-  return [...manifests].sort((a, b) => {
-    const latA = a.latency_hints?.[targetRegion]
-    const latB = b.latency_hints?.[targetRegion]
-    const inRegionsA = a.regions?.includes(targetRegion) ?? false
-    const inRegionsB = b.regions?.includes(targetRegion) ?? false
-
-    // Both have numeric latency hints
-    if (latA !== undefined && latB !== undefined) {
-      return latA - latB
-    }
-    if (latA !== undefined) return -1
-    if (latB !== undefined) return 1
-
-    // Neither has explicit latency hint, check regions inclusion
-    if (inRegionsA && !inRegionsB) return -1
-    if (!inRegionsA && inRegionsB) return 1
-
-    return 0
-  })
+export function priceForEndpoint(
+  manifest: KikisAppManifest,
+  endpointKey: string,
+  mode: PaymentMode,
+): bigint {
+  const descriptor = manifest.endpoints[endpointKey]
+  if (!descriptor) {
+    throw new KikisAppManifestError(
+      `Provider ${manifest.name} does not declare endpoint '${endpointKey}'`,
+    )
+  }
+  const price = descriptor.price
+  const amount = typeof price === 'string' ? price : price[mode]
+  if (!amount) {
+    throw new KikisAppNoSupportedModeError(
+      `Endpoint '${endpointKey}' does not declare a price for mode '${mode}'`,
+    )
+  }
+  return usdcToStroops(amount)
 }
 
+/**
+ * Enforce a caller-supplied policy against the manifest before paying.
+ */
+export function assertPolicy(
+  manifest: KikisAppManifest,
+  options: HttpRequestOptions,
+): void {
+  const policy = options.policy
+  if (!policy) return
+  if (policy.maxPriceUsdc !== undefined) {
+    const max = usdcToStroops(policy.maxPriceUsdc)
+    for (const [key, descriptor] of Object.entries(manifest.endpoints)) {
+      const price = descriptor.price
+      const amount = typeof price === 'string' ? price : price[manifest.default_mode ?? 'x402']
+      if (amount && usdcToStroops(amount) > max) {
+        throw new KikisAppPolicyRejectError(
+          `Endpoint '${key}' price ${amount} exceeds policy maxPriceUsdc ${policy.maxPriceUsdc}`,
+        )
+      }
+    }
+  }
+  if (policy.allowedProviders && !policy.allowedProviders.includes(manifest.name)) {
+    throw new KikisAppPolicyRejectError(
+      `Provider '${manifest.name}' is not in the allowedProviders policy`,
+    )
+  }
+}

@@ -17,6 +17,10 @@ jobs:
         uses: dtolnay/rust-toolchain@75be91dd2711b583df57c31d0873b4145c89f1d9 # branch 1.94.1
         with:
           targets: wasm32-unknown-unknown
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          workspaces: contracts/agent-vault
       - name: Run contract tests
         run: cargo test --manifest-path contracts/agent-vault/Cargo.toml
       - name: Run contract proptest invariants
@@ -146,5 +150,7 @@ jobs:
           cache: 'pnpm'
       - name: Install dependencies
         run: pnpm install
+      - name: Check formatting (Prettier)
+        run: pnpm format:check
       - name: Lint
         run: pnpm -r lint

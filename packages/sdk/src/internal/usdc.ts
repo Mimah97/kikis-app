@@ -82,6 +82,21 @@ export function stroopsToAmount(units: bigint, decimals: number): string {
 }
 
 /**
+ * Convert a USDC decimal amount string to integer stroops, enforcing that the
+ * result is strictly positive. Rejects zero, negative, and non-numeric inputs
+ * so spend reservations cannot deflate accumulators or corrupt accounting.
+ *
+ * Throws RangeError for malformed/negative input and for non-positive amounts.
+ */
+export function usdcToPositiveStroops(amount: string): bigint {
+  const micros = usdcToStroops(amount)
+  if (micros <= 0n) {
+    throw new RangeError(`Amount "${amount}" must be greater than zero`)
+  }
+  return micros
+}
+
+/**
  * @deprecated Use {@link usdcToStroops} — the same validated bigint converter.
  * Kept as a thin alias so existing call sites keep working during migration.
  */

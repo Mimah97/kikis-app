@@ -21,13 +21,21 @@ export interface NulthStellarSigner {
 }
 
 export interface NulthSignerConfig extends NulthClientConfig {
-  /** Pending payment context set before x402 signs auth entries */
+  /**
+   * Pending payment context set before x402 signs auth entries.
+   * @deprecated Shared mutable state causes race conditions under concurrent
+   * payments. Use `createScopedPaymentSigner(config, paymentContext)` instead,
+   * which binds the context immutably per payment.
+   */
   paymentContext?: Omit<PaymentAuthContext, 'authEntry'>
 }
 
 /**
  * Create an x402-compatible signer that pays from a Nulth ZK account.
  * Proofs are built off-chain; allowlist and cap never leave the agent.
+ *
+ * @deprecated Prefer `createScopedPaymentSigner` for concurrent payments — this
+ * signer reads `config.paymentContext`, which is shared mutable state.
  */
 export function createNulthSigner(config: NulthSignerConfig): NulthStellarSigner {
   const client = new NulthClient(config)
@@ -58,7 +66,43 @@ export function createNulthSigner(config: NulthSignerConfig): NulthStellarSigner
   }
 }
 
-/** Bind the next payment's public context before x402 calls signAuthEntry */
+/**
+ * Create a single-use signer whose payment context is bound immutably in closure
+ * scope. Each payment should get its own scoped signer so concurrent payments
+ * never cross-contaminate contexts.
+ */
+export function createScopedPaymentSigner(
+  config: NulthClientConfig,
+  paymentContext: Omit<PaymentAuthContext, 'authEntry'>,
+): NulthStellarSigner {
+  const client = new NulthClient(config)
+  const nulthAccount = config.nulthAccount
+  // Freeze a private copy so later mutation of the caller's object cannot leak in.
+  const ctx: Omit<PaymentAuthContext, 'authEntry'> = Object.freeze({ ...paymentContext })
+
+  return {
+    address: nulthAccount,
+    signAuthEntry: async (authEntry) => {
+      assertAuthEntryMatchesContext(authEntry, nulthAccount, ctx)
+
+      const proof = client.buildPaymentAuthProof({
+        authEntry,
+        ...ctx,
+      })
+
+      return {
+        signedAuthEntry: encodeAuthSignature(proof),
+        signerAddress: nulthAccount,
+      }
+    },
+  }
+}
+
+/**
+ * Bind the next payment's public context before x402 calls signAuthEntry.
+ * @deprecated Mutates shared config and is unsafe under concurrency. Use
+ * `createScopedPaymentSigner` instead.
+ */
 export function setNulthPaymentContext(
   config: NulthSignerConfig,
   context: Omit<PaymentAuthContext, 'authEntry'>,

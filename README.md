@@ -405,3 +405,11 @@ The [**Multi-Chain Roadmap**](docs/MULTICHAIN_ROADMAP.md) sketches a `ChainAdapt
 ## License
 
 MIT
+
+## Handsoff notes
+
+<!-- handsoff-issue-63 -->
+- #63: [Contracts] Add Expiration Grace Window to Pending Wasm Upgrades in Agent Vault Contract
+
+<!-- handsoff-issue-64 -->
+- #64: [Contracts] Implement Contract View Function for Current Daily Spend and Remaining Allowance

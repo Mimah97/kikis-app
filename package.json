@@ -6,6 +6,7 @@
     "dev": "pnpm -r --parallel dev",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
+    "format:check": "prettier --check .",
     "stress:test": "pnpm --filter agent stress",
     "version": "changeset version",
     "release": "pnpm run release:build && changeset publish",
@@ -15,6 +16,7 @@
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.7.0",
+    "prettier": "^3.3.3",
     "tsx": "^4.22.4",
     "typescript": "^5.4.5"
   },

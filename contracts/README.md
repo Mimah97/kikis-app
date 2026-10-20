@@ -31,6 +31,44 @@ The old immediate `upgrade(new_wasm_hash)` entry point has been removed. A contr
 
 This mechanism gives users notice before the enforcement code changes. It does **not** make the single-admin model trustless: the admin can still rotate agent keys and change caps, allowlists, expiry, and freeze state. Every target Wasm hash must be reviewed, and operators should monitor upgrade events.
 
+#### Ledger sequence vs. wall-clock time
+
+The notice period is enforced **strictly in ledger sequence space**: `calculate_upgrade_ready_at` adds `UPGRADE_TIMELOCK_LEDGERS` to `env.ledger().sequence()`, and `execute_upgrade` gates on `env.ledger().sequence() >= ready_at_ledger`. Readiness is **never** gated on `env.ledger().timestamp()`.
+
+This is a deliberate choice. Ledger sequence is monotonic and cannot be manipulated by a single party, whereas wall-clock timestamps are only advisory and can drift. The 17,280-ledger constant assumes a nominal **5-second** close time (≈24 hours), but actual elapsed wall-clock time varies with network conditions:
+
+- Under congestion (e.g. ~6.5s close times) the notice period stretches to **>31 hours**.
+- If close times accelerate, the notice period shortens below 24 hours.
+
+Because the guarantee is expressed in ledgers, the notice period is always *at least* `UPGRADE_TIMELOCK_LEDGERS` ledgers of on-chain ordering, regardless of how long those ledgers take in wall-clock terms. Clients that need a human-readable estimate should treat it as advisory only.
+
+To make the tradeoff observable, the `upgrade_proposed` event emits both `ready_at_ledger` (the authoritative gate) and `estimated_ready_timestamp` (an advisory wall-clock estimate derived from the current ledger timestamp plus the nominal 5s-per-ledger delay). The estimate is informational and must not be used to decide whether an upgrade is executable.
+
+### Guardian-assisted admin recovery
+
+The vault supports an optional guardian quorum so a single compromised or lost
+admin key cannot permanently brick the vault. Guardians are configured by the
+admin and stored in instance storage:
+
+- `set_guardians(guardians, threshold)` — admin only; sets the guardian set and the
+  number of approvals required (`threshold` must be `>= 1` and `<= guardians.len()`).
+  Passing an empty list disables guardian recovery.
+- `guardians()` / `guardian_threshold()` — read the current configuration.
+- `propose_admin_rotation(new_admin)` — a guardian proposes replacing the admin;
+  stores the target and the earliest executable ledger (a fixed timelock) and
+  emits `admin_rotation_proposed`.
+- `approve_admin_rotation(guardian)` — each guardian approves the pending proposal;
+  emits `admin_rotation_approved`.
+- `execute_admin_rotation()` — succeeds once at least `guardian_threshold` distinct
+  guardians have approved **and** the timelock has elapsed; sets the new admin,
+  clears the proposal, and emits `admin_rotated`. This path does **not** require
+  the current admin's authorization, so an unresponsive admin can be replaced.
+- `cancel_admin_rotation()` — admin only; clears a pending proposal.
+
+Guardian recovery is opt-in: when no guardians are configured the vault behaves
+exactly as before. The timelock gives the incumbent admin (and users) notice to
+react to a malicious or mistaken rotation before it takes effect.
+
 ### Prerequisites
 
 - Rust toolchain with `wasm32-unknown-unknown` target

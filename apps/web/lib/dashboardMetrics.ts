@@ -1,10 +1,12 @@
 import { usdcToStroops, USDC_DECIMALS } from '@kikis-app/nulth-sdk'
 
 /**
- * Row shape of the one-row `public_dashboard_stats` view (migration 005).
+ * Row shape of the per-network `public_dashboard_stats` view (migration 008).
+ * Each row is keyed by `network` so testnet and mainnet totals stay isolated.
  * `total_settled` is text so the exact 7-decimal sum survives the wire format.
  */
 export interface DashboardStatsRow {
+  network: string
   active_sessions: number | null
   open_vouchers: number | null
   total_settled: string | number | null
@@ -43,4 +45,18 @@ export function toDashboardMetrics(row: DashboardStatsRow | null | undefined): D
           }
         : undefined,
   }
+}
+
+/**
+ * Builds the Supabase query for the active network's stats row.
+ *
+ * The view now exposes one row per `network`, so the dashboard must filter by
+ * the active network environment — otherwise testnet dummy USDC would leak
+ * into mainnet reporting. Returns the query builder so callers can await it.
+ */
+export function dashboardStatsQuery(
+  client: { from: (table: string) => any },
+  activeNetwork: string,
+) {
+  return client.from('public_dashboard_stats').select('*').eq('network', activeNetwork).maybeSingle()
 }

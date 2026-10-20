@@ -21,6 +21,7 @@ import {
   encodeAuthSignature,
   decodeAuthSignature,
   createNulthSigner,
+  createScopedPaymentSigner,
   setNulthPaymentContext,
   paymentContextFromManifest,
   createPolicyState,
@@ -47,6 +48,7 @@ export {
   encodeAuthSignature,
   decodeAuthSignature,
   createNulthSigner,
+  createScopedPaymentSigner,
   setNulthPaymentContext,
   paymentContextFromManifest,
   createPolicyState,
@@ -155,14 +157,15 @@ export async function prepareNulthSigner(
     ...(vault.verifierContract !== undefined ? { verifierContract: vault.verifierContract } : {}),
   }
 
-  if (mode === 'x402' || mode === 'mpp-charge') {
-    setNulthPaymentContext(config, paymentContextFromManifest(manifest, mode, ledgerSequence))
-  } else {
+  if (mode !== 'x402' && mode !== 'mpp-charge') {
     throw new KikisAppVaultConfigError(`Nulth ZK vault does not support payment mode: ${mode}`)
   }
 
   try {
-    const signer = createNulthSigner(config)
+    // Bind the payment context to an isolated, single-use signer so concurrent
+    // payments never share mutable state on `config`.
+    const paymentContext = paymentContextFromManifest(manifest, mode, ledgerSequence)
+    const signer = createScopedPaymentSigner(config, paymentContext)
     return { signer: signer as ClientStellarSigner, config }
   } catch (err: unknown) {
     if (err instanceof KikisAppVaultConfigError) {
@@ -177,6 +180,17 @@ export async function prepareNulthSigner(
     }
     throw err
   }
+}
+
+/**
+ * Roll back an off-chain daily spend reservation after a failed Nulth payment
+ * submission (e.g. Horizon 504, bad sequence number, or node drop).
+ *
+ * Delegates to `NulthClient.rollbackPayment`, which asserts the accumulator
+ * cannot underflow before subtracting `amountStroops`.
+ */
+export function rollbackNulthSpend(client: NulthClient, amountStroops: bigint): void {
+  client.rollbackPayment(amountStroops)
 }
 
 export type { VaultMode }

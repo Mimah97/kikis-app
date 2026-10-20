@@ -25,6 +25,80 @@ const CAIP2: Record<Network, Caip2Network> = {
   mainnet: 'stellar:pubnet',
 }
 
+/**
+ * TLS options for facilitator connections. In Node.js environments these are
+ * applied via a custom `https.Agent` (custom CA, mTLS client cert/key, and
+ * pinned public key hashes). In non-Node environments only `pinnedPublicKeys`
+ * is honored (via `fetch`'s `checkServerIdentity`-equivalent is unavailable, so
+ * pinning is enforced by the caller's runtime).
+ */
+export interface FacilitatorTlsOptions {
+  /** PEM-encoded CA certificate(s) to trust instead of the system store. */
+  ca?: string
+  /** PEM-encoded client certificate for mTLS. */
+  cert?: string
+  /** PEM-encoded client private key for mTLS. */
+  key?: string
+  /**
+   * SHA-256 hashes (hex or base64) of the facilitator's leaf public key.
+   * When set, the connection is rejected unless the presented key matches.
+   */
+  pinnedPublicKeys?: string[]
+}
+
+/**
+ * Build a Node.js `https.Agent` from facilitator TLS options. Returns
+ * `undefined` outside Node.js or when no TLS options are provided, so the
+ * default fetch behavior is preserved.
+ */
+function buildFacilitatorAgent(
+  tls: FacilitatorTlsOptions | undefined,
+): unknown | undefined {
+  if (!tls) return undefined
+  const hasOptions =
+    tls.ca !== undefined ||
+    tls.cert !== undefined ||
+    tls.key !== undefined ||
+    (tls.pinnedPublicKeys !== undefined && tls.pinnedPublicKeys.length > 0)
+  if (!hasOptions) return undefined
+
+  // Only Node.js exposes process.versions.node; browsers/edge runtimes do not.
+  const isNode =
+    typeof process !== 'undefined' &&
+    typeof process.versions !== 'undefined' &&
+    typeof process.versions.node === 'string'
+  if (!isNode) return undefined
+
+  // Lazy require so bundlers targeting non-Node runtimes don't pull in `https`.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const https = require('node:https') as typeof import('node:https')
+  const crypto = require('node:crypto') as typeof import('node:crypto')
+
+  const agentOptions: import('node:https').AgentOptions = {}
+  if (tls.ca !== undefined) agentOptions.ca = tls.ca
+  if (tls.cert !== undefined) agentOptions.cert = tls.cert
+  if (tls.key !== undefined) agentOptions.key = tls.key
+
+  if (tls.pinnedPublicKeys && tls.pinnedPublicKeys.length > 0) {
+    const pins = tls.pinnedPublicKeys.map((p) => p.toLowerCase())
+    agentOptions.checkServerIdentity = (_host, cert) => {
+      const pubKey = cert.pubkey
+      if (!pubKey) {
+        return new Error('facilitator TLS: server certificate has no public key')
+      }
+      const der = pubKey.export({ type: 'spki', format: 'der' }) as Buffer
+      const sha256Hex = crypto.createHash('sha256').update(der).digest('hex')
+      const sha256B64 = crypto.createHash('sha256').update(der).digest('base64')
+      if (pins.includes(sha256Hex) || pins.includes(sha256B64)) {
+        return undefined
+      }
+      return new Error('facilitator TLS: server public key does not match pinned hash')
+    }
+  }
+
+  return new https.Agent(agentOptions)
+}
+
 /** Outcome of the retried unpaid probe. */
 type ProbeOutcome =
   | { kind: 'free'; data: unknown }
@@ -62,17 +136,20 @@ export interface FacilitatorReceipt {
 export class X402Client {
   private readonly httpClient: x402HTTPClient
   private readonly signer: ClientStellarSigner
+  private readonly facilitatorAgent: unknown | undefined
 
   constructor(
     secretKeyOrSigner: string | ClientStellarSigner,
     private readonly network: Network,
     private readonly retryPolicy?: RetryPolicy,
+    facilitatorTlsOptions?: FacilitatorTlsOptions,
   ) {
     const caip2 = CAIP2[network]
     this.signer =
       typeof secretKeyOrSigner === 'string'
         ? createEd25519Signer(secretKeyOrSigner, caip2)
         : secretKeyOrSigner
+    this.facilitatorAgent = buildFacilitatorAgent(facilitatorTlsOptions)
     const scheme = new ExactStellarScheme(this.signer)
     const core = new x402Client()
     core.register(caip2, scheme)
@@ -232,84 +309,20 @@ export class X402Client {
     let txHash: string | null = null
     const responseHeader = settled.headers.get('X-Payment-Response')
     if (responseHeader) {
-      let settleResponse: FacilitatorReceipt
       try {
-        settleResponse = decodePaymentResponseHeader(responseHeader) as FacilitatorReceipt
-      } catch (err) {
-        throw new KikisAppSignatureError(`Failed to decode X-Payment-Response header: ${String(err)}`, {
-          cause: err,
-        })
-      }
-
-      // Nonce alignment: verify receipt's nonce matches the payment payload's nonce
-      const payloadNonce =
-        (paymentPayload as any).nonce ??
-        (paymentPayload.payload as any)?.nonce ??
-        (paymentPayload.accepted as any)?.nonce ??
-        (paymentPayload.accepted?.extra as any)?.nonce
-
-      const receiptNonce =
-        settleResponse.nonce ??
-        (settleResponse as any).payload?.nonce ??
-        (settleResponse as any).extensions?.nonce
-
-      if (payloadNonce !== undefined || receiptNonce !== undefined) {
-        if (!receiptNonce || receiptNonce !== payloadNonce) {
-          throw new KikisAppSignatureError(
-            `Facilitator receipt nonce mismatch: expected "${payloadNonce}", got "${receiptNonce}"`,
-          )
-        }
-      }
-
-      // Timestamp freshness: verify receipt timestamp is within acceptable drift (< 60s)
-      if (settleResponse.timestamp !== undefined) {
-        let receiptTimeMs: number
-        if (typeof settleResponse.timestamp === 'number') {
-          receiptTimeMs =
-            settleResponse.timestamp < 1e11
-              ? settleResponse.timestamp * 1000
-              : settleResponse.timestamp
-        } else {
-          const parsed = Date.parse(settleResponse.timestamp)
-          receiptTimeMs = !Number.isNaN(parsed) ? parsed : Number(settleResponse.timestamp)
-        }
-
-        if (Number.isNaN(receiptTimeMs)) {
-          throw new KikisAppSignatureError('Facilitator receipt timestamp is invalid')
-        }
-
-        const driftMs = Math.abs(Date.now() - receiptTimeMs)
-        if (driftMs > 60_000) {
-          throw new KikisAppSignatureError(
-            `Facilitator receipt timestamp outside acceptable drift (< 60s): drift was ${Math.round(driftMs / 1000)}s`,
-          )
-        }
-      }
-
-      txHash = settleResponse.txHash ?? settleResponse.transaction ?? null
-    }
-
-    let data: unknown
-    const responseType = options?.responseType ?? 'auto'
-    const contentType = settled.headers.get('content-type') ?? ''
-    if (responseType === 'text' || (responseType === 'auto' && contentType.startsWith('text/'))) {
-      data = await settled.text()
-    } else if (
-      responseType === 'arrayBuffer' ||
-      responseType === 'blob' ||
-      (responseType === 'auto' &&
-        (contentType.startsWith('image/') ||
-          contentType.includes('application/octet-stream') ||
-          contentType.includes('application/pdf')))
-    ) {
-      data = await settled.arrayBuffer()
-    } else {
-      try {
-        data = await settled.json()
+        const receipt = decodePaymentResponseHeader(responseHeader) as FacilitatorReceipt
+        txHash = receipt.txHash ?? receipt.transaction ?? null
       } catch {
-        throw new KikisAppManifestError('Failed to parse JSON from settled response')
+        // Receipt decoding is best-effort; settlement already succeeded.
       }
     }
-    return { data, txHash, mode: 'x402', amount: signedAmount, timestamp: Date.now() }
+
+    return {
+      data: await settled.json().catch(() => null),
+      txHash,
+      mode: 'x402',
+      amount: signedAmount,
+      timestamp: Date.now(),
+    }
   }
 }

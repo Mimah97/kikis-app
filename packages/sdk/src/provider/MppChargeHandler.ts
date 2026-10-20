@@ -180,32 +180,106 @@ export function createMppChargeHandler(opts: MppChargeHandlerOptions): RequestHa
         receiptHeaders[k] = v
       })
 
-      // Extract tx hash from receipt headers if available
-      const receiptHeader = receipt.headers.get('payment-receipt')
+      // Extract tx hash from receipt headers if available.
+      // Probing candidate headers (standard payment-receipt, x-payment-response,
+      // x-stellar-tx-hash, mppx) ensures onSettled is not skipped when alternative
+      // header formats are emitted.
+      const RECEIPT_HEADER_CANDIDATES = [
+        'payment-receipt',
+        'x-payment-response',
+        'x-stellar-tx-hash',
+        'mppx',
+      ] as const
+
       let reference: string | undefined
-      if (receiptHeader) {
+      for (const headerName of RECEIPT_HEADER_CANDIDATES) {
+        const raw = receipt.headers.get(headerName)
+        if (!raw) continue
+
+        let parsedJson: Record<string, unknown> | null = null
         try {
-          const parsed = JSON.parse(
-            Buffer.from(receiptHeader, 'base64').toString('utf8'),
-          ) as { reference?: string }
-          reference = parsed.reference
+          const decoded = Buffer.from(raw, 'base64').toString('utf8')
+          parsedJson = JSON.parse(decoded) as Record<string, unknown>
         } catch {
-          // non-fatal — receipt is opaque/unparseable
+          try {
+            parsedJson = JSON.parse(raw) as Record<string, unknown>
+          } catch {
+            // Not JSON
+          }
+        }
+
+        if (parsedJson && typeof parsedJson === 'object') {
+          const extracted =
+            parsedJson.reference ??
+            parsedJson.txHash ??
+            parsedJson.tx_hash ??
+            parsedJson.hash
+          if (typeof extracted === 'string' && extracted.trim()) {
+            reference = extracted.trim()
+            break
+          } else {
+            logger('warn', `[mpp-charge] malformed receipt header ${headerName}: missing reference key`)
+          }
+        } else if (typeof raw === 'string' && raw.trim()) {
+          reference = raw.trim()
+          break
         }
       }
+
+      // Check request context and incoming request headers if still not found
+      if (!reference) {
+        for (const headerName of RECEIPT_HEADER_CANDIDATES) {
+          const reqHeader = req.headers[headerName]
+          const raw = Array.isArray(reqHeader) ? reqHeader[0] : reqHeader
+          if (!raw) continue
+          try {
+            const decoded = Buffer.from(raw, 'base64').toString('utf8')
+            const parsed = JSON.parse(decoded) as Record<string, unknown>
+            const extracted = parsed.reference ?? parsed.txHash ?? parsed.tx_hash ?? parsed.hash
+            if (typeof extracted === 'string' && extracted.trim()) {
+              reference = extracted.trim()
+              break
+            }
+          } catch {
+            if (typeof raw === 'string' && raw.trim()) {
+              reference = raw.trim()
+              break
+            }
+          }
+        }
+      }
+
+      // Check mppx result object or request context
+      if (!reference) {
+        const resObj = result as Record<string, unknown>
+        const ctxRef =
+          resObj.reference ??
+          resObj.txHash ??
+          resObj.tx_hash ??
+          (receipt as unknown as Record<string, unknown>).reference ??
+          (receipt as unknown as Record<string, unknown>).txHash ??
+          (req as unknown as Record<string, unknown>).txHash ??
+          (req as unknown as Record<string, unknown>).reference
+        if (typeof ctxRef === 'string' && ctxRef.trim()) {
+          reference = ctxRef.trim()
+        }
+      }
+
+      // Deterministic fallback reference if payment succeeded but reference couldn't be extracted
+      const settledRef = reference ?? (idempotencyKey ? `settled:${idempotencyKey}` : '')
 
       // Record the settlement so a retry of this exact charge is deduped.
       if (idempotencyKey) {
         try {
           await seenTxStore.set(idempotencyKey, {
-            txHash: reference ?? null,
+            txHash: reference ?? (settledRef || null),
             headers: receiptHeaders,
             createdAt: Date.now(),
           })
         } catch (setErr) {
           if (opts.fallbackSeenTxStore) {
             await opts.fallbackSeenTxStore.set(idempotencyKey, {
-              txHash: reference ?? null,
+              txHash: reference ?? (settledRef || null),
               headers: receiptHeaders,
               createdAt: Date.now(),
             })
@@ -215,8 +289,8 @@ export function createMppChargeHandler(opts: MppChargeHandlerOptions): RequestHa
         }
       }
 
-      if (reference && opts.onSettled) {
-        Promise.resolve().then(() => opts.onSettled!(reference!, opts.amount, 'mpp-charge', payerAddress)).catch(err => {
+      if (opts.onSettled) {
+        Promise.resolve().then(() => opts.onSettled!(settledRef, opts.amount, 'mpp-charge', payerAddress)).catch(err => {
           logger('error', '[mpp-charge] onSettled callback error', { error: err })
           opts.onCallbackError?.(err, 'onSettled')
         })
