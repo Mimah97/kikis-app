@@ -43,6 +43,14 @@ const COMMITMENT_SECRET = process.env.COMMITMENT_SECRET
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_KEY = process.env.SUPABASE_KEY || process.env.SUPABASE_SERVICE_KEY
 
+// Per-tool execution timeout (default 30s). Overridable via env for operators.
+const DEFAULT_TOOL_TIMEOUT_MS = 30_000
+const parsedToolTimeout = Number(process.env.KIKIS_APP_TOOL_TIMEOUT_MS)
+const TOOL_TIMEOUT_MS =
+  Number.isFinite(parsedToolTimeout) && parsedToolTimeout > 0
+    ? parsedToolTimeout
+    : DEFAULT_TOOL_TIMEOUT_MS
+
 if (process.env.SUPABASE_SERVICE_KEY) {
   console.warn('WARNING: Using SUPABASE_SERVICE_KEY bypasses RLS. Use an anon key for list_providers (anon + public_read_providers RLS is sufficient).')
 }
@@ -112,11 +120,46 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools: TOOLS }
 })
 
-// Call tool handler — delegates to pure handler functions in handlers.ts
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params
+// In-flight tool executions keyed by MCP request id, so a cancellation
+// notification can abort the matching AbortController.
+const inFlightTools = new Map<string | number, AbortController>()
 
-  try {
+// Listen for MCP protocol cancellation notifications and abort the matching
+// in-flight tool execution.
+server.setNotificationHandler(
+  { method: 'notifications/cancelled' } as never,
+  async (notification: { params?: { requestId?: string | number } }) => {
+    const requestId = notification?.params?.requestId
+    if (requestId === undefined) return
+    const controller = inFlightTools.get(requestId)
+    if (controller) {
+      controller.abort(new Error('Tool execution cancelled by MCP client'))
+    }
+  }
+)
+
+// Call tool handler — delegates to pure handler functions in handlers.ts
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+  const { name, arguments: args } = request.params
+  const requestId = extra?.requestId as string | number | undefined
+
+  const controller = new AbortController()
+  if (requestId !== undefined) {
+    inFlightTools.set(requestId, controller)
+  }
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      const err = new Error(
+        `Tool "${name}" timed out after ${TOOL_TIMEOUT_MS}ms`
+      )
+      controller.abort(err)
+      reject(err)
+    }, TOOL_TIMEOUT_MS)
+  })
+
+  const runTool = async () => {
     switch (name) {
       case 'pay_for_data':
         return await handlePayForData(args as unknown as PayForDataArgs, deps)
@@ -146,6 +189,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       default:
         throw new Error(`Unknown tool: ${name}`)
     }
+  }
+
+  try {
+    return await Promise.race([runTool(), timeoutPromise])
   } catch (error) {
     return {
       content: [
@@ -158,6 +205,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         },
       ],
       isError: true,
+    }
+  } finally {
+    if (timeoutHandle !== undefined) {
+      clearTimeout(timeoutHandle)
+    }
+    if (requestId !== undefined) {
+      inFlightTools.delete(requestId)
     }
   }
 })

@@ -5,12 +5,19 @@
 export interface NulthPolicyState {
   /** Maximum daily spend in stroops (7-decimal USDC) */
   dailyCapStroops: bigint
+  /**
+   * Optional per-asset daily caps keyed by SAC asset contract address (C...).
+   * When present, each asset is enforced independently against its own cap.
+   */
+  assetCaps?: Record<string, bigint>
   /** SHA-256 commitment to sorted allowlisted payee addresses (hex) */
   allowlistCommitment: string
   /** Allowed payee contract/account addresses — kept off-chain */
   allowedPayees: readonly string[]
   /** Cumulative spend for the current day bucket */
   dailySpendStroops: bigint
+  /** Optional per-asset cumulative spend for the current day bucket, keyed by asset contract */
+  assetSpendStroops?: Record<string, bigint>
   /** Ledger day bucket: ledger_sequence / 17280 */
   dayBucket: number
   /** Agent witness secret — binds proofs without exposing policy */
@@ -92,7 +99,7 @@ export interface NulthSignerConfig extends NulthClientConfig {
 }
 
 export class NulthPolicyError extends Error {
-  readonly code: 'payee_not_allowed' | 'daily_cap_exceeded' | 'session_expired' | 'auth_entry_mismatch'
+  readonly code: 'payee_not_allowed' | 'daily_cap_exceeded' | 'asset_cap_exceeded' | 'session_expired' | 'auth_entry_mismatch'
 
   constructor(code: NulthPolicyError['code'], message: string) {
     super(message)

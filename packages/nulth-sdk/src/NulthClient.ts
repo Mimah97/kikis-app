@@ -106,11 +106,13 @@ export class NulthClient {
     if (bucket !== this.policy.dayBucket) {
       this.policy.dayBucket = bucket
       this.policy.dailySpendStroops = 0n
+      this.policy.assetSpendStroops = {}
     }
 
     const authDigest = authDigestFromEntry(context.authEntry)
     const capCommitment = this.capCommitment
     const payeeHash = hashPayee(context.payee)
+    const assetId = context.asset ?? ''
 
     // Canonical binary preimage: length-prefixed fields, no delimiters.
     const preimage = serializePreimage([
@@ -137,6 +139,11 @@ export class NulthClient {
     }
 
     this.policy.dailySpendStroops += context.amountStroops
+    if (context.asset !== undefined) {
+      const assetSpend = this.policy.assetSpendStroops ?? {}
+      assetSpend[context.asset] = (assetSpend[context.asset] ?? 0n) + context.amountStroops
+      this.policy.assetSpendStroops = assetSpend
+    }
     return proof
   }
 
@@ -191,6 +198,23 @@ export class NulthClient {
     const projected = spend + context.amountStroops
     if (projected > this.policy.dailyCapStroops) {
       throw new NulthPolicyError('daily_cap_exceeded', 'Nulth daily cap exceeded')
+    }
+
+    if (context.asset !== undefined && this.policy.assetCaps !== undefined) {
+      const assetCap = this.policy.assetCaps[context.asset]
+      if (assetCap !== undefined) {
+        const assetSpend =
+          bucket === this.policy.dayBucket
+            ? this.policy.assetSpendStroops?.[context.asset] ?? 0n
+            : 0n
+        const assetProjected = assetSpend + context.amountStroops
+        if (assetProjected > assetCap) {
+          throw new NulthPolicyError(
+            'asset_cap_exceeded',
+            `Nulth daily cap exceeded for asset ${context.asset}`,
+          )
+        }
+      }
     }
   }
 }
