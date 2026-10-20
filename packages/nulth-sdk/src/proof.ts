@@ -33,7 +33,7 @@ export function canonicalEncodeStrings(items: readonly string[]): Uint8Array {
 
 /** Commitment to the daily cap — cap value never appears on-chain */
 export function commitDailyCap(dailyCapStroops: bigint, witnessSecret: string): string {
-  return sha256Hex(`${witnessSecret}:cap:${dailyCapStroops.toString()}`)
+  return sha256Hex(encodePreimage([witnessSecret, 'cap', dailyCapStroops.toString()]))
 }
 
 /** Commitment to sorted allowlist — individual payees never published */
@@ -48,7 +48,7 @@ export function commitAllowlist(payees: readonly string[], witnessSecret: string
 
 /** Hash a payee for public inputs without revealing the full allowlist */
 export function hashPayee(payee: string): string {
-  return sha256Hex(`payee:${payee}`)
+  return sha256Hex(encodePreimage(['payee', payee]))
 }
 
 /** Ledger day bucket aligned with agent-vault (17280 ledgers ≈ 24h) */
